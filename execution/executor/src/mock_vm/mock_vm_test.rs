@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{balance_ap, encode_mint_transaction, encode_transfer_transaction, seqnum_ap, MockVM};
-use config::config::VMConfig;
-use failure::Result;
-use state_view::StateView;
-use types::{
+use anyhow::Result;
+use libra_config::config::VMConfig;
+use libra_state_view::StateView;
+use libra_types::{
     access_path::AccessPath,
     account_address::{AccountAddress, ADDRESS_LENGTH},
     write_set::WriteOp,
 };
-use vm_runtime::VMExecutor;
+use libra_vm::VMExecutor;
 
 fn gen_address(index: u8) -> AccountAddress {
     AccountAddress::new([index; ADDRESS_LENGTH])
@@ -44,10 +44,11 @@ fn test_mock_vm_different_senders() {
         txns.clone(),
         &VMConfig::empty_whitelist_FOR_TESTING(),
         &MockStateView,
-    );
+    )
+    .expect("MockVM should not fail to start");
 
     for (output, txn) in itertools::zip_eq(outputs.iter(), txns.iter()) {
-        let sender = txn.sender();
+        let sender = txn.as_signed_user_txn().unwrap().sender();
         assert_eq!(
             output.write_set().iter().cloned().collect::<Vec<_>>(),
             vec![
@@ -77,7 +78,8 @@ fn test_mock_vm_same_sender() {
         txns,
         &VMConfig::empty_whitelist_FOR_TESTING(),
         &MockStateView,
-    );
+    )
+    .expect("MockVM should not fail to start");
 
     for (i, output) in outputs.iter().enumerate() {
         assert_eq!(
@@ -111,7 +113,8 @@ fn test_mock_vm_payment() {
         txns,
         &VMConfig::empty_whitelist_FOR_TESTING(),
         &MockStateView,
-    );
+    )
+    .expect("MockVM should not fail to start");
 
     let mut output_iter = output.iter();
     output_iter.next();

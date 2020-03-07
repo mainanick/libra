@@ -23,7 +23,7 @@ Admission Control (AC) implements two public APIs:
 2. UpdateToLatestLedger(UpdateToLatestLedgerRequest). No extra processing is performed in AC.
 * The request is directly passed to storage for query.
 
-## Folder Structure
+## How is this module organized?
 ```
     .
     ├── README.md
@@ -32,7 +32,6 @@ Admission Control (AC) implements two public APIs:
     │       └── proto                           # Protobuf definition files
     └── admission_control_service
         └── src                                 # gRPC service source files
-            ├── admission_control_node.rs       # Wrapper to run AC in a separate thread
             ├── admission_control_service.rs    # gRPC service and main logic
             ├── main.rs                         # Main entry to run AC as a binary
             └── unit_tests                      # Tests

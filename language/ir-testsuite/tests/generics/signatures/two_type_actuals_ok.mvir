@@ -1,0 +1,9 @@
+module M {
+    resource R { b: bool}
+    struct S<T1: resource, T2: unrestricted> { b: bool }
+
+    foo() {
+        let x: Self.S<Self.R, bool>;
+        return;
+    }
+}

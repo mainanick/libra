@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! This library implements a schematized DB on top of [RocksDB](https://rocksdb.org/). It makes
 //! sure all data passed in and out are structured according to predefined schemas and prevents
 //! access to raw keys and values. This library also enforces a set of Libra specific DB options,
@@ -15,11 +17,20 @@
 pub mod schema;
 
 use crate::schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec};
-use failure::prelude::*;
+use anyhow::{bail, format_err, Result};
+use libra_metrics::OpMetrics;
+use once_cell::sync::Lazy;
 use rocksdb::{
     rocksdb_options::ColumnFamilyDescriptor, CFHandle, DBOptions, Writable, WriteOptions,
 };
-use std::{collections::HashMap, iter::Iterator, marker::PhantomData, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    iter::Iterator,
+    marker::PhantomData,
+    path::Path,
+};
+
+static OP_COUNTER: Lazy<OpMetrics> = Lazy::new(|| OpMetrics::new_and_registered("schemadb"));
 
 /// Type alias to `rocksdb::ColumnFamilyOptions`. See [`rocksdb doc`](https://github.com/pingcap/rust-rocksdb/blob/master/src/rocksdb_options.rs)
 pub type ColumnFamilyOptions = rocksdb::ColumnFamilyOptions;
@@ -45,7 +56,7 @@ enum WriteOp {
 /// will be applied in the order in which they are added to the `SchemaBatch`.
 #[derive(Debug, Default)]
 pub struct SchemaBatch {
-    rows: Vec<(ColumnFamilyName, Vec<u8> /* key */, WriteOp)>,
+    rows: HashMap<ColumnFamilyName, BTreeMap<Vec<u8>, WriteOp>>,
 }
 
 impl SchemaBatch {
@@ -59,7 +70,10 @@ impl SchemaBatch {
         let key = <S::Key as KeyCodec<S>>::encode_key(key)?;
         let value = <S::Value as ValueCodec<S>>::encode_value(value)?;
         self.rows
-            .push((S::COLUMN_FAMILY_NAME, key, WriteOp::Value(value)));
+            .entry(S::COLUMN_FAMILY_NAME)
+            .or_insert_with(BTreeMap::new)
+            .insert(key, WriteOp::Value(value));
+
         Ok(())
     }
 
@@ -67,7 +81,10 @@ impl SchemaBatch {
     pub fn delete<S: Schema>(&mut self, key: &S::Key) -> Result<()> {
         let key = <S::Key as KeyCodec<S>>::encode_key(key)?;
         self.rows
-            .push((S::COLUMN_FAMILY_NAME, key, WriteOp::Deletion));
+            .entry(S::COLUMN_FAMILY_NAME)
+            .or_insert_with(BTreeMap::new)
+            .insert(key, WriteOp::Deletion);
+
         Ok(())
     }
 }
@@ -91,13 +108,17 @@ where
     }
 
     /// Seeks to the first key.
-    pub fn seek_to_first(&mut self) -> bool {
-        self.db_iter.seek(rocksdb::SeekKey::Start)
+    pub fn seek_to_first(&mut self) -> Result<bool> {
+        self.db_iter
+            .seek(rocksdb::SeekKey::Start)
+            .map_err(convert_rocksdb_err)
     }
 
     /// Seeks to the last key.
-    pub fn seek_to_last(&mut self) -> bool {
-        self.db_iter.seek(rocksdb::SeekKey::End)
+    pub fn seek_to_last(&mut self) -> Result<bool> {
+        self.db_iter
+            .seek(rocksdb::SeekKey::End)
+            .map_err(convert_rocksdb_err)
     }
 
     /// Seeks to the first key whose binary representation is equal to or greater than that of the
@@ -107,7 +128,9 @@ where
         SK: SeekKeyCodec<S>,
     {
         let key = <SK as SeekKeyCodec<S>>::encode_seek_key(seek_key)?;
-        Ok(self.db_iter.seek(rocksdb::SeekKey::Key(&key)))
+        self.db_iter
+            .seek(rocksdb::SeekKey::Key(&key))
+            .map_err(convert_rocksdb_err)
     }
 
     /// Seeks to the last key whose binary representation is less than or equal to that of the
@@ -119,7 +142,22 @@ where
         SK: SeekKeyCodec<S>,
     {
         let key = <SK as SeekKeyCodec<S>>::encode_seek_key(seek_key)?;
-        Ok(self.db_iter.seek_for_prev(rocksdb::SeekKey::Key(&key)))
+        self.db_iter
+            .seek_for_prev(rocksdb::SeekKey::Key(&key))
+            .map_err(convert_rocksdb_err)
+    }
+
+    fn next_impl(&mut self) -> Result<Option<(S::Key, S::Value)>> {
+        if !self.db_iter.valid().map_err(convert_rocksdb_err)? {
+            return Ok(None);
+        }
+
+        let raw_key = self.db_iter.key();
+        let raw_value = self.db_iter.value();
+        let key = <S::Key as KeyCodec<S>>::decode_key(&raw_key)?;
+        let value = <S::Value as ValueCodec<S>>::decode_value(&raw_value)?;
+        self.db_iter.next().map_err(convert_rocksdb_err)?;
+        Ok(Some((key, value)))
     }
 }
 
@@ -130,13 +168,7 @@ where
     type Item = Result<(S::Key, S::Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.db_iter.kv().map(|(raw_key, raw_value)| {
-            self.db_iter.next();
-            Ok((
-                <S::Key as KeyCodec<S>>::decode_key(&raw_key)?,
-                <S::Value as ValueCodec<S>>::decode_value(&raw_value)?,
-            ))
-        })
+        self.next_impl().transpose()
     }
 }
 
@@ -148,8 +180,8 @@ fn db_exists(path: &Path) -> bool {
 }
 
 /// All the RocksDB methods return `std::result::Result<T, String>`. Since our methods return
-/// `failure::Result<T>`, manual conversion is needed.
-fn convert_rocksdb_err(msg: String) -> failure::Error {
+/// `anyhow::Result<T>`, manual conversion is needed.
+fn convert_rocksdb_err(msg: String) -> anyhow::Error {
     format_err!("RocksDB internal error: {}.", msg)
 }
 
@@ -166,6 +198,10 @@ impl DB {
     pub fn open<P: AsRef<Path>>(path: P, mut cf_opts_map: ColumnFamilyOptionsMap) -> Result<Self> {
         let mut db_opts = DBOptions::new();
 
+        // For now we set the max total WAL size to be 1G. This config can be useful when column
+        // families are updated at non-uniform frequencies.
+        db_opts.set_max_total_wal_size(1 << 30);
+
         // If db exists, just open it with all cfs.
         if db_exists(path.as_ref()) {
             return DB::open_cf(db_opts, &path, cf_opts_map.into_iter().collect());
@@ -173,10 +209,6 @@ impl DB {
 
         // If db doesn't exist, create a db first with all column families.
         db_opts.create_if_missing(true);
-
-        // For now we set the max total WAL size to be 1G. This config can be useful when column
-        // families are updated at non-uniform frequencies.
-        db_opts.set_max_total_wal_size(1 << 30);
 
         let mut db = DB::open_cf(
             db_opts,
@@ -190,6 +222,29 @@ impl DB {
             .map(|(cf_name, cf_opts)| db.create_cf((cf_name, cf_opts)))
             .collect::<Result<Vec<_>>>()?;
         Ok(db)
+    }
+
+    /// Open db in readonly mode
+    pub fn open_readonly<P: AsRef<Path>>(
+        path: P,
+        cf_opts_map: ColumnFamilyOptionsMap,
+        db_log_dir: P,
+    ) -> Result<Self> {
+        if !db_exists(path.as_ref()) {
+            bail!("DB doesn't exists.");
+        }
+
+        let mut db_opts = DBOptions::new();
+
+        db_opts.create_if_missing(false);
+        db_opts.set_db_log_dir(db_log_dir.as_ref().to_str().ok_or_else(|| {
+            format_err!(
+                "db_log_dir {:?} can not be converted to string.",
+                db_log_dir.as_ref()
+            )
+        })?);
+
+        DB::open_cf_readonly(db_opts, &path, cf_opts_map.into_iter().collect())
     }
 
     fn open_cf<'a, P, T>(opts: DBOptions, path: P, cfds: Vec<T>) -> Result<DB>
@@ -209,6 +264,24 @@ impl DB {
         Ok(DB { inner })
     }
 
+    fn open_cf_readonly<'a, P, T>(opts: DBOptions, path: P, cfds: Vec<T>) -> Result<DB>
+    where
+        P: AsRef<Path>,
+        T: Into<ColumnFamilyDescriptor<'a>>,
+    {
+        let inner = rocksdb::DB::open_cf_for_read_only(
+            opts,
+            path.as_ref().to_str().ok_or_else(|| {
+                format_err!("Path {:?} can not be converted to string.", path.as_ref())
+            })?,
+            cfds,
+            false,
+        )
+        .map_err(convert_rocksdb_err)?;
+
+        Ok(DB { inner })
+    }
+
     fn create_cf<'a, T>(&mut self, cfd: T) -> Result<()>
     where
         T: Into<ColumnFamilyDescriptor<'a>>,
@@ -221,10 +294,14 @@ impl DB {
     pub fn get<S: Schema>(&self, schema_key: &S::Key) -> Result<Option<S::Value>> {
         let k = <S::Key as KeyCodec<S>>::encode_key(&schema_key)?;
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        let time = std::time::Instant::now();
 
-        self.inner
+        let result = self
+            .inner
             .get_cf(cf_handle, &k)
-            .map_err(convert_rocksdb_err)?
+            .map_err(convert_rocksdb_err)?;
+        OP_COUNTER.observe_duration(&format!("db_get_{}", S::COLUMN_FAMILY_NAME), time.elapsed());
+        result
             .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
             .transpose()
     }
@@ -240,6 +317,24 @@ impl DB {
             .map_err(convert_rocksdb_err)
     }
 
+    /// Delete all keys in range [begin, end).
+    ///
+    /// `SK` has to be an explicit type parameter since
+    /// https://github.com/rust-lang/rust/issues/44721
+    pub fn range_delete<S, SK>(&self, begin: &SK, end: &SK) -> Result<()>
+    where
+        S: Schema,
+        SK: SeekKeyCodec<S>,
+    {
+        let raw_begin = begin.encode_seek_key()?;
+        let raw_end = end.encode_seek_key()?;
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+
+        self.inner
+            .delete_range_cf(&cf_handle, &raw_begin, &raw_end)
+            .map_err(convert_rocksdb_err)
+    }
+
     /// Returns a [`SchemaIterator`] on a certain schema.
     pub fn iter<S: Schema>(&self, opts: ReadOptions) -> Result<SchemaIterator<S>> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
@@ -249,27 +344,77 @@ impl DB {
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: SchemaBatch) -> Result<()> {
         let db_batch = rocksdb::WriteBatch::new();
-        for (cf_name, key, write_op) in &batch.rows {
+        for (cf_name, rows) in &batch.rows {
             let cf_handle = self.get_cf_handle(cf_name)?;
-            match write_op {
-                WriteOp::Value(value) => db_batch.put_cf(cf_handle, &key, &value),
-                WriteOp::Deletion => db_batch.delete_cf(cf_handle, &key),
+            for (key, write_op) in rows {
+                match write_op {
+                    WriteOp::Value(value) => db_batch.put_cf(cf_handle, key, value),
+                    WriteOp::Deletion => db_batch.delete_cf(cf_handle, key),
+                }
+                .map_err(convert_rocksdb_err)?;
             }
-            .map_err(convert_rocksdb_err)?;
         }
 
         self.inner
             .write_opt(&db_batch, &default_write_options())
-            .map_err(convert_rocksdb_err)
+            .map_err(convert_rocksdb_err)?;
+
+        // Bump counters only after DB write succeeds.
+        for (cf_name, rows) in &batch.rows {
+            for (key, write_op) in rows {
+                match write_op {
+                    WriteOp::Value(value) => OP_COUNTER.observe(
+                        &format!("db_put_bytes_{}", cf_name),
+                        (key.len() + value.len()) as f64,
+                    ),
+                    WriteOp::Deletion => OP_COUNTER.inc(&format!("db_delete_{}", cf_name)),
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    fn get_cf_handle(&self, cf_name: ColumnFamilyName) -> Result<&CFHandle> {
+    fn get_cf_handle(&self, cf_name: &str) -> Result<&CFHandle> {
         self.inner.cf_handle(cf_name).ok_or_else(|| {
             format_err!(
                 "DB::cf_handle not found for column family name: {}",
                 cf_name
             )
         })
+    }
+
+    /// Returns the approximate size of each non-empty column family in bytes.
+    pub fn get_approximate_sizes_cf(&self) -> Result<BTreeMap<String, u64>> {
+        let mut cf_sizes = BTreeMap::new();
+
+        for cf_name in self.inner.cf_names().into_iter().map(ToString::to_string) {
+            let cf_handle = self.get_cf_handle(&cf_name)?;
+            let size = self
+                .inner
+                .get_property_int_cf(cf_handle, "rocksdb.estimate-live-data-size")
+                .ok_or_else(|| {
+                    format_err!(
+                        "Unable to get approximate size of {} column family.",
+                        cf_name,
+                    )
+                })?;
+            cf_sizes.insert(cf_name, size);
+        }
+
+        Ok(cf_sizes)
+    }
+
+    /// Flushes all memtable data. If `sync` is true, the flush will wait until it's done. This is
+    /// only used for testing `get_approximate_sizes_cf` in unit tests.
+    pub fn flush_all(&self, sync: bool) -> Result<()> {
+        for cf_name in self.inner.cf_names() {
+            let cf_handle = self.get_cf_handle(cf_name)?;
+            self.inner
+                .flush_cf(cf_handle, sync)
+                .map_err(convert_rocksdb_err)?;
+        }
+        Ok(())
     }
 }
 

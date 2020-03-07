@@ -8,52 +8,6 @@
 
 macro_rules! impl_array_newtype {
     ($thing:ident, $ty:ty, $len:expr) => {
-        impl $thing {
-            #[inline]
-            /// Converts the object to a raw pointer
-            pub fn as_ptr(&self) -> *const $ty {
-                let &$thing(ref dat) = self;
-                dat.as_ptr()
-            }
-
-            #[inline]
-            /// Converts the object to a mutable raw pointer
-            pub fn as_mut_ptr(&mut self) -> *mut $ty {
-                let &mut $thing(ref mut dat) = self;
-                dat.as_mut_ptr()
-            }
-
-            #[inline]
-            /// Returns the length of the object as an array
-            pub fn len(&self) -> usize {
-                $len
-            }
-
-            #[inline]
-            /// Returns whether the object, as an array, is empty. Always false.
-            pub fn is_empty(&self) -> bool {
-                false
-            }
-
-            #[inline]
-            /// Returns the underlying bytes.
-            pub fn as_bytes(&self) -> &[$ty; $len] {
-                &self.0
-            }
-
-            #[inline]
-            /// Returns the underlying bytes.
-            pub fn to_bytes(&self) -> [$ty; $len] {
-                self.0.clone()
-            }
-
-            #[inline]
-            /// Returns the underlying bytes.
-            pub fn into_bytes(self) -> [$ty; $len] {
-                self.0
-            }
-        }
-
         impl<'a> From<&'a [$ty]> for $thing {
             fn from(data: &'a [$ty]) -> $thing {
                 assert_eq!(data.len(), $len);
@@ -68,6 +22,7 @@ macro_rules! impl_array_newtype {
 
             #[inline]
             fn index(&self, index: usize) -> &$ty {
+                precondition!(index < $len);
                 let &$thing(ref dat) = self;
                 &dat[index]
             }
@@ -95,7 +50,7 @@ macro_rules! impl_array_newtype {
             #[inline]
             fn cmp(&self, other: &$thing) -> ::std::cmp::Ordering {
                 // manually implement comparison to get little-endian ordering
-                // (we need this for our numeric types; non-numeric ones shouldn't
+                // (we need this for our numeric libra_types; non-numeric ones shouldn't
                 // be ordered anyway except to put them in BTrees or whatever, and
                 // they don't care how we order as long as we're consistent).
                 for i in 0..$len {

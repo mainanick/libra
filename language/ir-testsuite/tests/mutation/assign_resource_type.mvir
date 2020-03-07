@@ -1,0 +1,21 @@
+module A {
+    import 0x0.LibraCoin;
+    resource T {fr: LibraCoin.T}
+
+    public new(y: LibraCoin.T): Self.T {
+        return T{fr: move(y)};
+    }
+    public destroy(a: Self.T) {
+        let fr: LibraCoin.T;
+        T { fr } = move(a);
+        LibraCoin.destroy_zero(move(fr));
+        return;
+    }
+    public t(this: &mut Self.T, y: LibraCoin.T) {
+        let x: &mut LibraCoin.T;
+        x = &mut move(this).fr;
+        *move(x) = move(y);
+        return;
+    }
+}
+// check: WRITEREF_RESOURCE_ERROR

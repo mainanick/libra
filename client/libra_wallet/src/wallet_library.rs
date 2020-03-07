@@ -3,7 +3,7 @@
 
 //! The following document is a minimalist version of Libra Wallet. Note that this Wallet does
 //! not promote security as the mnemonic is stored in unencrypted form. In future iterations,
-//! we will be realesing more robust Wallet implementations. It is our intention to present a
+//! we will be releasing more robust Wallet implementations. It is our intention to present a
 //! foundation that is simple to understand and incrementally improve the LibraWallet
 //! implementation and it's security guarantees throughout testnet. For a more robust wallet
 //! reference, the authors suggest to audit the file of the same name in the rust-wallet crate.
@@ -12,21 +12,19 @@
 //! https://github.com/rust-bitcoin/rust-wallet/blob/master/wallet/src/walletlibrary.rs
 
 use crate::{
-    error::*,
+    error::WalletError,
     io_utils,
     key_factory::{ChildNumber, KeyFactory, Seed},
     mnemonic::Mnemonic,
 };
+use anyhow::Result;
 use libra_crypto::hash::CryptoHash;
-use proto_conv::{FromProto, IntoProto};
-use protobuf::Message;
+use libra_types::{
+    account_address::AccountAddress,
+    transaction::{helpers::TransactionSigner, RawTransaction, SignedTransaction},
+};
 use rand::{rngs::EntropyRng, Rng};
 use std::{collections::HashMap, path::Path};
-use types::{
-    account_address::AccountAddress,
-    proto::transaction::SignedTransaction as ProtoSignedTransaction,
-    transaction::{RawTransaction, RawTransactionBytes, SignedTransaction},
-};
 
 /// WalletLibrary contains all the information needed to recreate a particular wallet
 pub struct WalletLibrary {
@@ -58,7 +56,7 @@ impl WalletLibrary {
         }
     }
 
-    /// Function that returns the string representation of the WalletLibrary Menmonic
+    /// Function that returns the string representation of the WalletLibrary Mnemonic
     /// NOTE: This is not secure, and in general the mnemonic should be stored in encrypted format
     pub fn mnemonic(&self) -> String {
         self.mnemonic.to_string()
@@ -89,7 +87,8 @@ impl WalletLibrary {
         if current > depth {
             return Err(WalletError::LibraWalletGeneric(
                 "Addresses already generated up to the supplied depth".to_string(),
-            ));
+            )
+            .into());
         }
         while self.key_leaf != ChildNumber(depth) {
             let _ = self.new_address();
@@ -111,13 +110,15 @@ impl WalletLibrary {
     pub fn new_address(&mut self) -> Result<(AccountAddress, ChildNumber)> {
         let child = self.key_factory.private_child(self.key_leaf)?;
         let address = child.get_address()?;
-        let child = self.key_leaf;
+        let old_key_leaf = self.key_leaf;
         self.key_leaf.increment();
-        match self.addr_map.insert(address, child) {
-            Some(_) => Err(WalletError::LibraWalletGeneric(
+        if self.addr_map.insert(address, old_key_leaf).is_none() {
+            Ok((address, old_key_leaf))
+        } else {
+            Err(WalletError::LibraWalletGeneric(
                 "This address is already in your wallet".to_string(),
-            )),
-            None => Ok((address, child)),
+            )
+            .into())
         }
     }
 
@@ -140,7 +141,8 @@ impl WalletLibrary {
                         "Child num {} not exist while depth is {}",
                         i,
                         self.addr_map.len()
-                    )))
+                    ))
+                    .into())
                 }
             }
         }
@@ -150,29 +152,27 @@ impl WalletLibrary {
     /// Simple public function that allows to sign a Libra RawTransaction with the PrivateKey
     /// associated to a particular AccountAddress. If the PrivateKey associated to an
     /// AccountAddress is not contained in the addr_map, then this function will return an Error
-    pub fn sign_txn(
-        &self,
-        addr: &AccountAddress,
-        txn: RawTransaction,
-    ) -> Result<SignedTransaction> {
-        if let Some(child) = self.addr_map.get(addr) {
-            let raw_bytes = txn.into_proto().write_to_bytes()?;
-            let txn_hashvalue = RawTransactionBytes(&raw_bytes).hash();
-
+    pub fn sign_txn(&self, txn: RawTransaction) -> Result<SignedTransaction> {
+        if let Some(child) = self.addr_map.get(&txn.sender()) {
             let child_key = self.key_factory.private_child(child.clone())?;
-            let signature = child_key.sign(txn_hashvalue);
-            let public_key = child_key.get_public();
-
-            let mut signed_txn = ProtoSignedTransaction::new();
-            signed_txn.set_raw_txn_bytes(raw_bytes.to_vec());
-            signed_txn.set_sender_public_key(public_key.to_bytes().to_vec());
-            signed_txn.set_sender_signature(signature.to_bytes().to_vec());
-
-            Ok(SignedTransaction::from_proto(signed_txn)?)
+            let signature = child_key.sign(txn.hash());
+            Ok(SignedTransaction::new(
+                txn,
+                child_key.get_public(),
+                signature,
+            ))
         } else {
             Err(WalletError::LibraWalletGeneric(
                 "Well, that address is nowhere to be found... This is awkward".to_string(),
-            ))
+            )
+            .into())
         }
+    }
+}
+
+/// WalletLibrary naturally support TransactionSigner trait.
+impl TransactionSigner for WalletLibrary {
+    fn sign_txn(&self, raw_txn: RawTransaction) -> Result<SignedTransaction, anyhow::Error> {
+        Ok(self.sign_txn(raw_txn)?)
     }
 }

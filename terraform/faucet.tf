@@ -1,22 +1,13 @@
 locals {
   faucet_image_repo = var.faucet_image_repo
-  faucet_image_tag = var.faucet_image_tag
-}
-
-resource "aws_secretsmanager_secret" "faucet" {
-  name                    = "${terraform.workspace}-faucet"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "faucet" {
-  secret_id     = aws_secretsmanager_secret.faucet.id
-  secret_string = filebase64("${var.validator_set}/mint.key")
+  faucet_image_tag  = var.faucet_image_tag
 }
 
 resource "aws_instance" "faucet" {
-  ami                         = data.aws_ami.ecs.id
+  ami                         = local.aws_ecs_ami
   instance_type               = "t3.medium"
   subnet_id                   = element(aws_subnet.testnet.*.id, 0)
+  depends_on                  = [aws_main_route_table_association.testnet]
   vpc_security_group_ids      = [aws_security_group.faucet-host.id]
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
@@ -36,18 +27,19 @@ data "template_file" "ecs_faucet_definition" {
   vars = {
     faucet_image_repo    = local.faucet_image_repo
     faucet_image_tag_str = substr(var.image_tag, 0, 6) == "sha256" ? "@${local.faucet_image_tag}" : ":${local.faucet_image_tag}"
-    ac_hosts      = join(",", aws_instance.validator.*.private_ip)
-    trusted_peers = jsonencode(file("${var.validator_set}/trusted_peers.config.toml"))
-    secret        = aws_secretsmanager_secret.faucet.arn
-    log_level     = var.faucet_log_level
-    log_group     = aws_cloudwatch_log_group.testnet.name
-    log_region    = var.region
-    log_prefix    = "faucet"
+    ac_hosts             = join(",", aws_instance.validator.*.private_ip)
+    cfg_num_validators   = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
+    cfg_seed             = var.config_seed
+    log_level            = var.faucet_log_level
+    log_group            = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
+    log_region           = var.region
+    log_prefix           = "faucet"
   }
 }
 
 resource "aws_ecs_task_definition" "faucet" {
   family                = "${terraform.workspace}-faucet"
+  depends_on            = [aws_instance.validator]
   container_definitions = data.template_file.ecs_faucet_definition.rendered
   execution_role_arn    = aws_iam_role.ecsTaskExecutionRole.arn
 
@@ -68,6 +60,7 @@ resource "aws_ecs_service" "faucet" {
   task_definition                    = aws_ecs_task_definition.faucet.arn
   desired_count                      = 1
   deployment_minimum_healthy_percent = 0
+  count                              = var.cluster_test ? 0 : 1
 
   tags = {
     Role      = "faucet"

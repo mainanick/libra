@@ -3,7 +3,7 @@ terraform {
 }
 
 provider "aws" {
-  version = "~> 2.12"
+  version = "~> 2.43"
   region  = var.region
 }
 
@@ -11,4 +11,3 @@ data "aws_availability_zones" "available" {
   state             = "available"
   blacklisted_names = ["us-west-2d", "us-east-1e"]
 }
-

@@ -3,6 +3,7 @@
 
 /// This module provides various indexes used by Mempool
 use crate::core_mempool::transaction::{MempoolTransaction, TimelineState};
+use libra_types::account_address::AccountAddress;
 use std::{
     cmp::Ordering,
     collections::{btree_set::Iter, BTreeMap, BTreeSet},
@@ -10,7 +11,6 @@ use std::{
     ops::Bound,
     time::Duration,
 };
-use types::account_address::AccountAddress;
 
 pub type AccountTransactions = BTreeMap<u64, MempoolTransaction>;
 
@@ -59,6 +59,10 @@ impl PriorityIndex {
     /// returns iterator over priority queue
     pub(crate) fn iter(&self) -> PriorityQueueIter {
         self.data.iter().rev()
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -210,6 +214,22 @@ impl TimelineIndex {
         batch
     }
 
+    /// read all transactions from timeline for timeline id in range (`start_timeline_id`, `end_timeline_id`]
+    pub(crate) fn range(
+        &mut self,
+        start_timeline_id: u64,
+        end_timeline_id: u64,
+    ) -> Vec<(AccountAddress, u64)> {
+        let mut batch = vec![];
+        for (_, &(address, sequence_number)) in self.timeline.range((
+            Bound::Excluded(start_timeline_id),
+            Bound::Included(end_timeline_id),
+        )) {
+            batch.push((address, sequence_number));
+        }
+        batch
+    }
+
     /// add transaction to index
     pub(crate) fn insert(&mut self, txn: &mut MempoolTransaction) {
         self.timeline.insert(
@@ -256,6 +276,10 @@ impl ParkingLotIndex {
     /// returns random "non-ready" transaction (with highest sequence number for that account)
     pub(crate) fn pop(&mut self) -> Option<TxnPointer> {
         self.data.iter().rev().next().cloned()
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.data.len()
     }
 }
 

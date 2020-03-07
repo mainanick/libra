@@ -28,173 +28,199 @@
 //! to the protocol), or actively trying to spread misinformation in the network. In the future, we
 //! plan to remedy this by introducing a module dedicated to detecting byzantine behavior, and by
 //! making the discovery protocol itself tolerant to byzantine faults.
-//! - As an optimization, instead of creating a new substream to the chosen peer in each round, we
-//! could maintain a cache of open substreams which could be re-used across numerous rounds.
 //!
 //! [`ConnectivityManager`]: ../../connectivity_manager
 use crate::{
-    common::NegotiatedSubstream,
     connectivity_manager::ConnectivityRequest,
+    counters,
     error::{NetworkError, NetworkErrorKind},
-    peer_manager::{PeerManagerNotification, PeerManagerRequestSender},
-    proto::{DiscoveryMsg, Note, PeerInfo},
-    utils, NetworkPublicKeys, ProtocolId,
+    peer_manager::{PeerManagerRequest, PeerManagerRequestSender},
+    protocols::network::{Event, NetworkEvents, NetworkSender},
+    validator_network::network_builder::NetworkBuilder,
+    NetworkPublicKeys, ProtocolId,
 };
 use bytes::Bytes;
-use channel;
-use crypto::{
+use channel::{libra_channel, message_queues::QueueStyle};
+use futures::{
+    sink::SinkExt,
+    stream::{FusedStream, Stream, StreamExt},
+};
+use libra_config::config::RoleType;
+use libra_crypto::{
+    ed25519::*,
     hash::{CryptoHasher, DiscoveryMsgHasher},
     HashValue, Signature,
 };
-use futures::{
-    compat::{Future01CompatExt, Sink01CompatExt},
-    future::{Future, FutureExt, TryFutureExt},
-    io::{AsyncRead, AsyncReadExt, AsyncWrite},
-    sink::SinkExt,
-    stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
-};
-use logger::prelude::*;
+use libra_logger::prelude::*;
+use libra_security_logger::{security_log, SecurityEvent};
+use libra_types::{crypto_proxies::ValidatorSigner as Signer, PeerId};
 use parity_multiaddr::Multiaddr;
-use protobuf::{self, Message};
 use rand::{rngs::SmallRng, FromEntropy, Rng};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    convert::TryFrom,
-    fmt::Debug,
-    pin::Pin,
+    cmp::max,
+    collections::{HashMap, HashSet},
+    convert::TryInto,
     sync::{Arc, RwLock},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
-use tokio::{codec::Framed, prelude::FutureExt as _};
-use types::{
-    validator_signer::ValidatorSigner as Signer,
-    validator_verifier::ValidatorVerifier as SignatureValidator, PeerId,
-};
-use unsigned_varint::codec::UviBytes;
 
 #[cfg(test)]
 mod test;
 
-pub const DISCOVERY_PROTOCOL_NAME: &[u8] = b"/libra/discovery/0.1.0";
+pub const DISCOVERY_DIRECT_SEND_PROTOCOL: &[u8] = b"/libra/direct-send/0.1.0/discovery/0.1.0";
+
+/// The interface from Network to Discovery module.
+///
+/// `DiscoveryNetworkEvents` is a `Stream` of `PeerManagerNotification` where the
+/// raw `Bytes` rpc messages are deserialized into
+/// `DiscoveryMsg` types. `DiscoveryNetworkEvents` is a thin wrapper
+/// around a `channel::Receiver<PeerManagerNotification>`.
+pub type DiscoveryNetworkEvents = NetworkEvents<DiscoveryMsg>;
+
+/// The interface from Discovery to Networking layer.
+///
+/// This is a thin wrapper around a `NetworkSender<Discoverymsg>`, so it is
+/// easy to clone and send off to a separate task. For example, the rpc requests
+/// return Futures that encapsulate the whole flow, from sending the request to
+/// remote, to finally receiving the response and deserializing. It therefore
+/// makes the most sense to make the rpc call on a separate async task, which
+/// requires the `DiscoveryNetworkSender` to be `Clone` and `Send`.
+#[derive(Clone)]
+pub struct DiscoveryNetworkSender {
+    inner: NetworkSender<DiscoveryMsg>,
+}
+
+/// Register the discovery sender and event handler with network and return interfaces for those
+/// actors.
+pub fn add_to_network(
+    network: &mut NetworkBuilder,
+) -> (DiscoveryNetworkSender, DiscoveryNetworkEvents) {
+    let (sender, receiver, control_notifs_rx) = network.add_protocol_handler(
+        vec![],
+        vec![ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL)],
+        QueueStyle::LIFO,
+        Some(&counters::PENDING_DISCOVERY_NETWORK_EVENTS),
+    );
+    (
+        DiscoveryNetworkSender::new(sender),
+        DiscoveryNetworkEvents::new(receiver, control_notifs_rx),
+    )
+}
+
+impl DiscoveryNetworkSender {
+    /// Create a new Discovery sender
+    pub fn new(inner: libra_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>) -> Self {
+        Self {
+            inner: NetworkSender::new(PeerManagerRequestSender::new(inner)),
+        }
+    }
+
+    /// Send a DiscoveryMsg to a peer.
+    pub fn send_to(&mut self, peer: PeerId, msg: DiscoveryMsg) -> Result<(), NetworkError> {
+        self.inner.send_to(
+            peer,
+            ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL),
+            msg,
+        )
+    }
+}
 
 /// The actor running the discovery protocol.
-pub struct Discovery<TTicker, TSubstream> {
-    /// Note for self.
-    self_note: Note,
+pub struct Discovery<TTicker> {
+    /// Note for self, which is prefixed with an underscore as this is not used but is in
+    /// preparation for logic that changes the advertised Note while the validator is running.
+    note: VerifiedNote,
+    /// PeerId for self.
+    peer_id: PeerId,
+    /// Our node type.
+    role: RoleType,
+    /// The DNS domain name other public full nodes should query to get this
+    /// validator's list of full nodes.
+    dns_seed_addr: Bytes,
     /// Validator for verifying signatures on messages.
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
+    /// Signer for signing notes.
+    signer: Signer,
     /// Current state, maintaining the most recent Note for each peer, alongside parsed PeerInfo.
-    known_peers: HashMap<PeerId, (PeerInfo, Note)>,
-    /// Info for seed peers.
-    seed_peers: HashMap<PeerId, PeerInfo>,
+    known_peers: HashMap<PeerId, VerifiedNote>,
     /// Currently connected peers.
-    connected_peers: HashMap<PeerId, Multiaddr>,
+    connected_peers: HashSet<PeerId>,
     /// Ticker to trigger state send to a random peer. In production, the ticker is likely to be
     /// fixed duration interval timer.
     ticker: TTicker,
-    /// Channel to send requests to PeerManager.
-    peer_mgr_reqs_tx: PeerManagerRequestSender<TSubstream>,
-    /// Channel to receive notifications from PeerManager.
-    peer_mgr_notifs_rx: channel::Receiver<PeerManagerNotification<TSubstream>>,
+    /// Handle to send requests to Network.
+    network_reqs_tx: DiscoveryNetworkSender,
+    /// Handle to receive notifications from Network.
+    network_notifs_rx: DiscoveryNetworkEvents,
     /// Channel to send requests to ConnectivityManager.
     conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
-    /// Message timeout duration.
-    msg_timeout: Duration,
     /// Random-number generator.
     rng: SmallRng,
 }
 
-impl<TTicker, TSubstream> Discovery<TTicker, TSubstream>
+impl<TTicker> Discovery<TTicker>
 where
     TTicker: Stream + FusedStream + Unpin,
-    TSubstream: AsyncRead + AsyncWrite + Send + Unpin + Debug + 'static,
 {
     pub fn new(
         self_peer_id: PeerId,
+        role: RoleType,
         self_addrs: Vec<Multiaddr>,
         signer: Signer,
-        seed_peers: HashMap<PeerId, PeerInfo>,
         trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
         ticker: TTicker,
-        peer_mgr_reqs_tx: PeerManagerRequestSender<TSubstream>,
-        peer_mgr_notifs_rx: channel::Receiver<PeerManagerNotification<TSubstream>>,
+        network_reqs_tx: DiscoveryNetworkSender,
+        network_notifs_rx: DiscoveryNetworkEvents,
         conn_mgr_reqs_tx: channel::Sender<ConnectivityRequest>,
-        msg_timeout: Duration,
     ) -> Self {
-        let self_peer_info = create_peer_info(self_addrs);
-        let self_note = create_note(&signer, self_peer_id, self_peer_info.clone());
-        let known_peers = vec![(self_peer_id, (self_peer_info, self_note.clone()))]
+        // TODO(philiphayes): wire through config
+        let dns_seed_addr = b"example.com";
+
+        let epoch = get_unix_epoch();
+        let self_note = Note::new(&signer, self_peer_id, self_addrs, dns_seed_addr, epoch);
+        let self_verified_note = VerifiedNote(self_note);
+
+        let known_peers = vec![(self_peer_id, self_verified_note.clone())]
             .into_iter()
             .collect();
-        Self {
-            self_note,
-            seed_peers,
-            trusted_peers,
-            known_peers,
-            connected_peers: HashMap::new(),
-            ticker,
-            peer_mgr_reqs_tx,
-            peer_mgr_notifs_rx,
-            conn_mgr_reqs_tx,
-            msg_timeout,
-            rng: SmallRng::from_entropy(),
-        }
-    }
 
-    // Connect with all the seed peers. If current node is also a seed peer, remove it from the
-    // list.
-    async fn connect_to_seed_peers(&mut self) {
-        let self_peer_id = PeerId::try_from(self.self_note.get_peer_id()).unwrap();
-        for (peer_id, peer_info) in self
-            .seed_peers
-            .iter()
-            .filter(|(peer_id, _)| **peer_id != self_peer_id)
-        {
-            self.conn_mgr_reqs_tx
-                .send(ConnectivityRequest::UpdateAddresses(
-                    *peer_id,
-                    peer_info
-                        .get_addrs()
-                        .iter()
-                        .map(|addr| Multiaddr::try_from(addr.clone()).unwrap())
-                        .collect(),
-                ))
-                .await
-                .unwrap();
+        Self {
+            note: self_verified_note,
+            peer_id: self_peer_id,
+            role,
+            dns_seed_addr: Bytes::from_static(dns_seed_addr),
+            trusted_peers,
+            signer,
+            known_peers,
+            connected_peers: HashSet::new(),
+            ticker,
+            network_reqs_tx,
+            network_notifs_rx,
+            conn_mgr_reqs_tx,
+            rng: SmallRng::from_entropy(),
         }
     }
 
     // Starts the main event loop for the discovery actor. We bootstrap by first dialing all the
     // seed peers, and then entering the event handling loop. Messages are received from:
     // - a ticker to trigger discovery message send to a random connected peer
-    // - an incoming substream from a peer wishing to send its state
+    // - an incoming message from a peer wishing to send its state
     // - an internal task once it has processed incoming messages from a peer, and wishes for
     // discovery actor to update its state.
     pub async fn start(mut self) {
-        // Bootstrap by connecting to seed peers.
-        self.connect_to_seed_peers().await;
-        let mut unprocessed_inbound = FuturesUnordered::new();
-        let mut unprocessed_outbound = FuturesUnordered::new();
+        // Ensure our metrics counter has an initial value.
+        self.record_num_discovery_notes();
+
+        debug!("Starting Discovery actor event loop");
         loop {
             futures::select! {
+                notif = self.network_notifs_rx.select_next_some() => {
+                    self.handle_network_event(notif).await;
+                },
                 _ = self.ticker.select_next_some() => {
-                    self.handle_tick(&mut unprocessed_outbound);
+                    self.handle_tick();
                 }
-                notif = self.peer_mgr_notifs_rx.select_next_some() => {
-                    self.handle_peer_mgr_notification(notif, &mut unprocessed_inbound);
-                },
-                (peer_id, stream_result) = unprocessed_inbound.select_next_some() => {
-                    match stream_result {
-                        Ok(remote_notes) => {
-                            self.reconcile(peer_id, remote_notes).await;
-                        }
-                        Err(e) => {
-                            warn!("Failure in processing stream from peer: {}. Error: {:?}",
-                                  peer_id.short_str(), e);
-                        }
-                    }
-                },
-                _ = unprocessed_outbound.select_next_some() => {}
                 complete => {
                     crit!("Discovery actor terminated");
                     break;
@@ -207,77 +233,61 @@ where
     // 1. Selecting a random peer to send state to.
     // 2. Compose the msg to send.
     // 3. Spawn off a new task to push the msg to the peer.
-    fn handle_tick<'a>(
-        &'a mut self,
-        unprocessed_outbound: &'a mut FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    ) {
+    fn handle_tick(&mut self) {
+        debug!("Discovery interval tick");
         // On each tick, we choose a random neighbor and push our state to it.
         if let Some(peer) = self.choose_random_neighbor() {
             // We clone `peer_mgr_reqs_tx` member of Self, since using `self` inside fut below
             // triggers some lifetime errors.
-            let sender = self.peer_mgr_reqs_tx.clone();
+            let mut sender = self.network_reqs_tx.clone();
             // Compose discovery msg to send.
             let msg = self.compose_discovery_msg();
-            let timeout = self.msg_timeout;
-            let fut = async move {
-                if let Err(err) = push_state_to_peer(sender, peer, msg)
-                    .boxed()
-                    .compat()
-                    .timeout(timeout)
-                    .compat()
-                    .await
-                {
-                    warn!(
-                        "Failed to send discovery msg to {}; error: {:?}",
-                        peer.short_str(),
-                        err
-                    );
-                }
+            if let Err(err) = sender.send_to(peer, msg) {
+                warn!(
+                    "Failed to send discovery msg to {}; error: {:?}",
+                    peer.short_str(),
+                    err
+                );
             };
-            unprocessed_outbound.push(fut.boxed());
         }
     }
 
-    fn handle_peer_mgr_notification<'a>(
-        &'a mut self,
-        notif: PeerManagerNotification<TSubstream>,
-        unprocessed_inbound: &'a mut FuturesUnordered<
-            Pin<Box<dyn Future<Output = (PeerId, Result<Vec<Note>, NetworkError>)> + Send>>,
-        >,
-    ) {
-        trace!("PeerManagerNotification::{:?}", notif);
-        match notif {
-            PeerManagerNotification::NewPeer(peer_id, addr) => {
-                // Add peer to connected peer list.
-                self.connected_peers.insert(peer_id, addr);
-            }
-            PeerManagerNotification::LostPeer(peer_id, addr) => {
-                match self.connected_peers.get(&peer_id) {
-                    Some(curr_addr) if *curr_addr == addr => {
-                        // Remove node from connected peers list.
+    async fn handle_network_event(&mut self, event: Result<Event<DiscoveryMsg>, NetworkError>) {
+        trace!("Network event::{:?}", event);
+        match event {
+            Ok(e) => {
+                match e {
+                    Event::NewPeer(peer_id) => {
+                        // Add peer to connected peer list.
+                        self.connected_peers.insert(peer_id);
+                    }
+                    Event::LostPeer(peer_id) => {
+                        // Remove peer from connected peer list.
                         self.connected_peers.remove(&peer_id);
                     }
-                    _ => {
-                        debug!(
-                            "Received redundant lost peer notification for {}",
-                            peer_id.short_str()
-                        );
+                    Event::Message((peer_id, msg)) => {
+                        match handle_discovery_msg(msg, self.trusted_peers.clone(), peer_id) {
+                            Ok(verified_notes) => {
+                                self.reconcile(peer_id, verified_notes).await;
+                                self.record_num_discovery_notes();
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failure in processing stream from peer: {}. Error: {:?}",
+                                    peer_id.short_str(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Event::RpcRequest(req) => {
+                        warn!("Unexpected notification from network: {:?}", req);
+                        debug_assert!(false);
                     }
                 }
             }
-            PeerManagerNotification::NewInboundSubstream(peer_id, substream) => {
-                // We should not receive substreams from peer manager for any other protocol.
-                assert_eq!(substream.protocol, DISCOVERY_PROTOCOL_NAME);
-                // Add future to handle new inbound substream.
-                unprocessed_inbound.push(
-                    handle_inbound_substream(
-                        self.trusted_peers.clone(),
-                        peer_id,
-                        substream,
-                        self.msg_timeout,
-                    )
-                    .boxed(),
-                );
+            Err(err) => {
+                info!("Received error: {}", err);
             }
         }
     }
@@ -285,9 +295,9 @@ where
     // Chooses a random connected neighbour.
     fn choose_random_neighbor(&mut self) -> Option<PeerId> {
         if !self.connected_peers.is_empty() {
-            let peers: Vec<_> = self.connected_peers.keys().collect();
+            let peers: Vec<_> = self.connected_peers.iter().cloned().collect();
             let idx = self.rng.gen_range(0, peers.len());
-            Some(*peers[idx])
+            Some(peers[idx])
         } else {
             None
         }
@@ -295,33 +305,29 @@ where
 
     // Creates DiscoveryMsg to be sent to some remote peer.
     fn compose_discovery_msg(&self) -> DiscoveryMsg {
-        let mut msg = DiscoveryMsg::new();
-        let notes = msg.mut_notes();
-        for (_, note) in self.known_peers.values() {
-            notes.push(note.clone());
-        }
-        msg
+        let notes = self
+            .known_peers
+            .values()
+            .map(|note| note.as_note())
+            .cloned()
+            .collect::<Vec<_>>();
+        DiscoveryMsg { notes }
     }
 
     // Updates local state by reconciling with notes received from some remote peer.
     // Assumption: `remote_notes` have already been verified for signature validity and content.
-    async fn reconcile(&mut self, remote_peer: PeerId, remote_notes: Vec<Note>) {
+    async fn reconcile(&mut self, remote_peer: PeerId, remote_notes: Vec<VerifiedNote>) {
         // If a peer is previously unknown, or has a newer epoch number, we update its
         // corresponding entry in the map.
-        let self_peer_id = PeerId::try_from(self.self_note.get_peer_id()).unwrap();
-        for note in remote_notes {
-            let peer_id = PeerId::try_from(note.get_peer_id()).unwrap();
-            let peer_info: PeerInfo = protobuf::parse_from_bytes(note.get_peer_info()).unwrap();
-            match self.known_peers.get_mut(&peer_id) {
+        for mut note in remote_notes.into_iter() {
+            match self.known_peers.get_mut(&note.as_note().peer_id) {
                 // If we know about this peer, and receive the same or an older epoch, we do
                 // nothing.
-                Some((ref curr_peer_info, _))
-                    if peer_info.get_epoch() <= curr_peer_info.get_epoch() =>
-                {
-                    if peer_info.get_epoch() < curr_peer_info.get_epoch() {
+                Some(ref curr_note) if note.as_note().epoch() <= curr_note.as_note().epoch() => {
+                    if note.as_note().epoch() < curr_note.as_note().epoch() {
                         debug!(
                             "Received stale note for peer: {} from peer: {}",
-                            peer_id.short_str(),
+                            note.as_note().peer_id.short_str(),
                             remote_peer
                         );
                     }
@@ -330,193 +336,280 @@ where
                 _ => {
                     info!(
                         "Received updated note for peer: {} from peer: {}",
-                        peer_id.short_str(),
+                        note.as_note().peer_id.short_str(),
                         remote_peer.short_str()
                     );
-                    // We can never receive a note with a higher epoch number on us than what we
-                    // ourselves have broadcasted.
-                    assert_ne!(peer_id, self_peer_id);
+                    // It is unlikely that we receive a note with a higher epoch number on us than
+                    // what we ourselves have broadcasted. However, this can happen in case of
+                    // the clock being reset, or the validator process being restarted on a node
+                    // with clock behind the previous node. In such scenarios, it's best to issue a
+                    // newer note with an epoch number higher than what we observed (unless the
+                    // issued epoch number is u64::MAX).
+                    if note.as_note().peer_id == self.peer_id {
+                        info!(
+                            "Received an older note for self, but with higher epoch. \
+                             Previous epoch: {}, current epoch: {}",
+                            note.as_note().epoch(),
+                            self.note.as_note().epoch()
+                        );
+                        if note.as_note().epoch() == std::u64::MAX {
+                            security_log(SecurityEvent::InvalidDiscoveryMsg)
+                                .data(
+                                    "Older note received for self has u64::MAX epoch. \
+                                     This likely means that the node's network signing key has \
+                                     been compromised.",
+                                )
+                                .log();
+                            continue;
+                        }
+                        let unverified_note = Note::new(
+                            &self.signer,
+                            self.peer_id,
+                            self.note.as_note().addrs().clone(),
+                            &self.dns_seed_addr,
+                            max(note.as_note().epoch() + 1, get_unix_epoch()),
+                        );
+                        self.note = VerifiedNote(unverified_note);
+                        note = self.note.clone();
+                    } else {
+                        // The multiaddrs in the peer's discovery Note.
+                        let peer_addrs = note.as_note().addrs().clone();
+
+                        self.conn_mgr_reqs_tx
+                            .send(ConnectivityRequest::UpdateAddresses(
+                                note.as_note().peer_id,
+                                peer_addrs,
+                            ))
+                            .await
+                            .expect("ConnectivityRequest::UpdateAddresses send");
+                    }
                     // Update internal state of the peer with new Note.
-                    self.known_peers.insert(peer_id, (peer_info.clone(), note));
-                    self.conn_mgr_reqs_tx
-                        .send(ConnectivityRequest::UpdateAddresses(
-                            peer_id,
-                            peer_info
-                                .get_addrs()
-                                .iter()
-                                .map(|addr| Multiaddr::try_from(addr.clone()).unwrap())
-                                .collect(),
-                        ))
-                        .await
-                        .unwrap();
+                    self.known_peers.insert(note.as_note().peer_id, note);
                 }
             }
         }
     }
+
+    // Record the number of verified discovery notes we have for _other_ peers
+    // (not including our own note). We exclude counting our own note to be
+    // consistent with the "connected_peers" metric.
+    fn record_num_discovery_notes(&self) {
+        let num_other_notes = self
+            .known_peers
+            .iter()
+            .filter(|(peer_id, _)| *peer_id != &self.peer_id)
+            .count();
+        let num_other_notes: i64 = num_other_notes.try_into().unwrap_or(0);
+
+        counters::LIBRA_NETWORK_DISCOVERY_NOTES
+            .with_label_values(&[self.role.as_str()])
+            .set(num_other_notes);
+    }
 }
 
-// Creates a PeerInfo combining the given addresses with the current unix timestamp as epoch.
-fn create_peer_info(addrs: Vec<Multiaddr>) -> PeerInfo {
-    let mut peer_info = PeerInfo::new();
+/// A Discovery message contains notes collected from other peers within the system.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiscoveryMsg {
+    notes: Vec<Note>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VerifiedNote(Note);
+
+impl VerifiedNote {
+    /// Give access to the internal note
+    fn as_note(&self) -> &Note {
+        &self.0
+    }
+}
+
+/// A `Note` contains a validator's signed `PeerInfo` as well as a signed
+/// `FullNodePayload`, which provides relevant discovery info for public full
+/// nodes and clients.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Note {
+    /// Id of the peer.
+    peer_id: PeerId,
+    /// The validator node's signed `PeerInfo`.
+    signed_peer_info: SignedPeerInfo,
+    /// The validator node's signed `FullNodePayload`.
+    signed_full_node_info: SignedFullNodeInfo,
+}
+
+impl Note {
+    fn new(
+        signer: &Signer,
+        peer_id: PeerId,
+        addrs: Vec<Multiaddr>,
+        dns_seed_addr: &[u8],
+        epoch: u64,
+    ) -> Self {
+        let peer_info = PeerInfo { addrs, epoch };
+        let signed_peer_info = peer_info.sign(&signer);
+
+        let full_node_info = FullNodeInfo {
+            dns_seed_addr: dns_seed_addr.to_vec(),
+            epoch,
+        };
+        let signed_full_node_info = full_node_info.sign(&signer);
+
+        Note {
+            peer_id,
+            signed_peer_info,
+            signed_full_node_info,
+        }
+    }
+
+    /// Verifies validity of notes. Most fields have already been verified during initial
+    /// deserialization, so this only verifies that the note contains properly signed infos.
+    fn verify(self, pub_key: &Ed25519PublicKey) -> Result<VerifiedNote, NetworkError> {
+        self.signed_peer_info.verify(&pub_key)?;
+        self.signed_full_node_info.verify(&pub_key)?;
+        Ok(VerifiedNote(self))
+    }
+
+    /// Shortcut to the addrs embedded within the Note
+    fn addrs(&self) -> &Vec<Multiaddr> {
+        &self.signed_peer_info.peer_info.addrs
+    }
+
+    /// The current implementation derives epoch from the PeerInfo.
+    fn epoch(&self) -> u64 {
+        self.signed_peer_info.peer_info.epoch
+    }
+}
+
+/// A `PeerInfo` authenticated by the peer's root `network_signing_key` stored on-chain.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SignedPeerInfo {
+    /// A `PeerInfo` represents the network address(es) of a Peer.
+    peer_info: PeerInfo,
+    /// A signature over the above serialzed `PeerInfo`, signed by the validator's
+    /// `network_signing_key` referred to by the `peer_id` account address.
+    signature: Ed25519Signature,
+}
+
+impl SignedPeerInfo {
+    fn verify(&self, pub_key: &Ed25519PublicKey) -> Result<(), NetworkError> {
+        let peer_info_bytes =
+            lcs::to_bytes(&self.peer_info).map_err(|_| NetworkErrorKind::ParsingError)?;
+        self.signature
+            .verify(&get_hash(&peer_info_bytes), &pub_key)
+            .map_err(|_| NetworkErrorKind::SignatureError)?;
+        Ok(())
+    }
+}
+
+/// A `PeerInfo` represents the network address(es) of a Peer.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PeerInfo {
+    /// Network addresses this peer can be reached at.
+    addrs: Vec<Multiaddr>,
+    /// Monotonically increasing incarnation number used to allow peers to issue
+    /// updates to their `PeerInfo` and prevent attackers from propagating old
+    /// `PeerInfo`s. This is usually a timestamp.
+    epoch: u64,
+}
+
+impl PeerInfo {
+    fn sign(self, signer: &Signer) -> SignedPeerInfo {
+        let peer_info_bytes = lcs::to_bytes(&self).expect("LCS serialization fails");
+        let signature = signer
+            .sign_message(get_hash(&peer_info_bytes))
+            .expect("Message signing fails");
+        SignedPeerInfo {
+            peer_info: self,
+            signature,
+        }
+    }
+}
+
+/// A `FullNodeInfo` authenticated by the peer's root `network_signing_key` stored on-chain.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SignedFullNodeInfo {
+    full_node_info: FullNodeInfo,
+    /// A signature over the above serialzed `FullNodeInfo`, signed by the validator's
+    /// `network_signing_key` referred to by the `peer_id` account address.
+    signature: Ed25519Signature,
+}
+
+impl SignedFullNodeInfo {
+    fn verify(&self, pub_key: &Ed25519PublicKey) -> Result<(), NetworkError> {
+        let full_node_info_bytes =
+            lcs::to_bytes(&self.full_node_info).map_err(|_| NetworkErrorKind::ParsingError)?;
+        self.signature
+            .verify(&get_hash(&full_node_info_bytes), &pub_key)
+            .map_err(|_| NetworkErrorKind::SignatureError)?;
+        Ok(())
+    }
+}
+
+/// Discovery information relevant to public full nodes and clients.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FullNodeInfo {
+    /// The DNS domain name other public full nodes should query to get this
+    /// validator's list of full nodes.
+    dns_seed_addr: Vec<u8>,
+    /// Monotonically increasing incarnation number used to allow peers to issue
+    /// updates to their `FullNodePayload` and prevent attackers from propagating
+    /// old `FullNodePayload`s. This is usually a timestamp.
+    epoch: u64,
+}
+
+impl FullNodeInfo {
+    fn sign(self, signer: &Signer) -> SignedFullNodeInfo {
+        let full_node_info_bytes = lcs::to_bytes(&self).expect("LCS serialization failed");
+        let signature = signer
+            .sign_message(get_hash(&full_node_info_bytes))
+            .expect("Message signing fails");
+        SignedFullNodeInfo {
+            full_node_info: self,
+            signature,
+        }
+    }
+}
+
+fn get_unix_epoch() -> u64 {
     // TODO: Currently, SystemTime::now() in Rust is not guaranteed to use a monotonic clock.
     // At the moment, it's unclear how to do this in a platform-agnostic way. For Linux, we
     // could use something like the [timerfd trait](https://docs.rs/crate/timerfd/1.0.0).
-    let time_since_epoch = SystemTime::now()
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("System clock reset to before unix epoch")
-        .as_millis() as u64;
-    peer_info.set_epoch(time_since_epoch);
-    peer_info.set_addrs(addrs.into_iter().map(|addr| addr.as_ref().into()).collect());
-    peer_info
+        .as_millis() as u64
 }
 
-// Creates a note by signing the given peer info, and combining the signature, peer_info and
-// peer_id into a note.
-fn create_note(signer: &Signer, peer_id: PeerId, peer_info: PeerInfo) -> Note {
-    let raw_info = peer_info.write_to_bytes().unwrap();
-    // Now that we have the serialized peer info, we sign it.
-    let signature = sign(&signer, &raw_info);
-    let mut note = Note::default();
-    note.set_peer_id(peer_id.into());
-    note.set_peer_info(raw_info.into());
-    note.set_signature(signature.into());
-    note
-}
-
-// Handles an inbound substream from a remote peer as follows:
-// 1. Reads the DiscoveryMsg sent by the remote.
-// 2. Verifies signatures on all notes contained in the message.
-// 3. Sends a message to the discovery peer with the notes received from the remote.
-async fn handle_inbound_substream<TSubstream>(
+// Handles an inbound message from a remote peer as follows:
+// Verifies signatures on all notes contained in the message.
+fn handle_discovery_msg(
+    msg: DiscoveryMsg,
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
     peer_id: PeerId,
-    substream: NegotiatedSubstream<TSubstream>,
-    timeout: Duration,
-) -> (PeerId, Result<Vec<Note>, NetworkError>)
-where
-    TSubstream: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    // Read msg from stream.
-    let result = recv_msg(substream.substream)
-        .boxed()
-        .compat()
-        .timeout(timeout)
-        .compat()
-        .map_err(Into::<NetworkError>::into)
-        .await
-        .and_then(|mut msg| {
-            let _ = msg
-                .get_notes()
-                .iter()
-                .map(|note| {
-                    is_valid(&note.to_owned(), trusted_peers.clone()).map_err(|e| {
-                        security_log(SecurityEvent::InvalidNetworkPeer)
-                            .error(&e)
-                            .data(&note)
-                            .data(&trusted_peers)
-                            .log();
-                        e
-                    })
-                })
-                .collect::<Result<Vec<_>, NetworkError>>()?;
-            Ok(msg.take_notes().into_vec())
-        });
-    (peer_id, result)
-}
-
-// Verifies validity of notes. Following conditions should be met for validity:
-// 1. We should be able to correctly parse the peer id in each note.
-// 2. The signature should be verified to be of the given peer for the serialized peer info.
-// 3. The address(es) in the PeerInfo should be correctly parsable as Multiaddrs.
-fn is_valid(
-    note: &Note,
-    trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-) -> Result<(), NetworkError> {
-    let peer_id = PeerId::try_from(note.get_peer_id())
-        .map_err(|err| err.context(NetworkErrorKind::ParsingError))?;
-    verify_signatures(
-        trusted_peers,
-        peer_id,
-        note.get_signature(),
-        note.get_peer_info(),
-    )?;
-    let peer_info: PeerInfo = protobuf::parse_from_bytes(note.get_peer_info())?;
-    for addr in peer_info.get_addrs() {
-        let _: Multiaddr = Multiaddr::try_from(addr.clone())?;
+) -> Result<Vec<VerifiedNote>, NetworkError> {
+    // Check that all received `Note`s are valid -- reject the whole message
+    // if any `Note` is invalid.
+    let mut verified_notes = vec![];
+    for note in msg.notes.into_iter() {
+        let rlock = trusted_peers.read().unwrap();
+        let pub_key = rlock
+            .get(&note.peer_id)
+            .ok_or_else(|| NetworkErrorKind::SignatureError)?;
+        let pub_key = &pub_key.signing_public_key;
+        let verified_note = note.verify(&pub_key).map_err(|err| {
+            security_log(SecurityEvent::InvalidDiscoveryMsg)
+                .error(&err)
+                .data(&peer_id)
+                .data(&trusted_peers)
+                .log();
+            err
+        })?;
+        verified_notes.push(verified_note);
     }
-    Ok(())
+    Ok(verified_notes)
 }
 
 fn get_hash(msg: &[u8]) -> HashValue {
     let mut hasher = DiscoveryMsgHasher::default();
     hasher.write(msg);
     hasher.finish()
-}
-
-fn verify_signatures(
-    trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-    signer: PeerId,
-    signature: &[u8],
-    msg: &[u8],
-) -> Result<(), NetworkError> {
-    let verifier = SignatureValidator::new(
-        trusted_peers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(peer_id, network_public_keys)| {
-                (*peer_id, network_public_keys.signing_public_key)
-            })
-            .collect(),
-        1, /* quorum size */
-    );
-    let signature = Signature::from_compact(signature)
-        .map_err(|err| err.context(NetworkErrorKind::SignatureError))?;
-    verifier.verify_signature(signer, get_hash(msg), &signature)?;
-    Ok(())
-}
-
-fn sign(signer: &Signer, msg: &[u8]) -> Vec<u8> {
-    signer
-        .sign_message(get_hash(msg))
-        .unwrap()
-        .to_compact()
-        .to_vec()
-}
-
-async fn push_state_to_peer<TSubstream>(
-    mut sender: PeerManagerRequestSender<TSubstream>,
-    peer_id: PeerId,
-    msg: DiscoveryMsg,
-) -> Result<(), NetworkError>
-where
-    TSubstream: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    trace!(
-        "Push discovery message to peer {} msg: {:?}",
-        peer_id.short_str(),
-        msg
-    );
-    // Request a new substream to peer.
-    let substream = sender
-        .open_substream(peer_id, ProtocolId::from_static(DISCOVERY_PROTOCOL_NAME))
-        .await?;
-    // Messages are length-prefixed. Wrap in a framed stream.
-    let mut substream = Framed::new(substream.compat(), UviBytes::default()).sink_compat();
-    // Send serialized message to peer.
-    let bytes = msg
-        .write_to_bytes()
-        .expect("writing protobuf failed; should never happen");
-    substream.send(Bytes::from(bytes)).await?;
-    Ok(())
-}
-
-async fn recv_msg<TSubstream>(substream: TSubstream) -> Result<DiscoveryMsg, NetworkError>
-where
-    TSubstream: AsyncRead + AsyncWrite + Unpin,
-{
-    // Messages are length-prefixed. Wrap in a framed stream.
-    let mut substream = Framed::new(substream.compat(), UviBytes::<Bytes>::default()).sink_compat();
-    // Read the message.
-    utils::read_proto(&mut substream).await
 }

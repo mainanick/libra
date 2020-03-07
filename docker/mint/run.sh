@@ -1,4 +1,6 @@
 #!/bin/sh
+# Copyright (c) The Libra Core Contributors
+# SPDX-License-Identifier: Apache-2.0
 
 # Example Usage:
 # ./run.sh <IMAGE> <AC_HOST> <AC_PORT> <LOG_LEVEL>
@@ -6,12 +8,17 @@
 
 set -ex
 
-IMAGE="$1"
+IMAGE="${1:-libra_mint:latest}"
+AC_HOST="${2:-172.18.0.13}"
+AC_PORT="${3:-8000}"
+LOG_LEVEL="${4:-info}"
 CONFIGDIR="$(dirname "$0")/../../terraform/validator-sets/dev"
 
 docker network create --subnet 172.18.0.0/24 testnet || true
 
-docker run -p 8000:8000 -e AC_HOST=$2 -e AC_PORT=$3 -e LOG_LEVEL=$4 \
-    -e TRUSTED_PEERS="$(cat $CONFIGDIR/trusted_peers.config.toml)" \
-    -e MINT_KEY="$(base64 $CONFIGDIR/mint.key)" \
-    --network testnet $IMAGE
+docker run \
+    -e AC_HOST="$AC_HOST" \
+    -e AC_PORT="$AC_PORT" \
+    -e LOG_LEVEL="$LOG_LEVEL" \
+	-e MINT_KEY="$(base64 $CONFIGDIR/mint.key)" \
+	--network testnet --publish 8080:8000 "$IMAGE"

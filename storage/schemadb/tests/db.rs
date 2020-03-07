@@ -1,8 +1,9 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Result;
 use byteorder::{LittleEndian, ReadBytesExt};
-use failure::Result;
+use proptest::{collection::vec, prelude::*};
 use schemadb::{
     define_schema,
     schema::{KeyCodec, Schema, ValueCodec},
@@ -70,7 +71,7 @@ impl ValueCodec<TestSchema2> for TestField {
     }
 }
 
-fn open_db(dir: &tempfile::TempDir) -> DB {
+fn open_db(dir: &libra_temppath::TempPath) -> DB {
     let cf_opts_map: ColumnFamilyOptionsMap = [
         (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
         (
@@ -85,17 +86,17 @@ fn open_db(dir: &tempfile::TempDir) -> DB {
     .iter()
     .cloned()
     .collect();
-    DB::open(&dir, cf_opts_map).expect("Failed to open DB.")
+    DB::open(&dir.path(), cf_opts_map).expect("Failed to open DB.")
 }
 
 struct TestDB {
-    _tmpdir: tempfile::TempDir,
+    _tmpdir: libra_temppath::TempPath,
     db: DB,
 }
 
 impl TestDB {
     fn new() -> Self {
-        let tmpdir = tempfile::tempdir().expect("Failed to create temporary directory.");
+        let tmpdir = libra_temppath::TempPath::new();
         let db = open_db(&tmpdir);
 
         TestDB {
@@ -153,11 +154,40 @@ fn test_schema_put_get() {
     );
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    #[test]
+    fn test_schema_range_delete(
+        ranges_to_delete in vec(
+            (0..100u32).prop_flat_map(|begin| (Just(begin), (begin..100u32))), 0..10)
+    ) {
+        let db = TestDB::new();
+        for i in 0..100u32 {
+            db.put::<TestSchema1>(&TestField(i), &TestField(i)).unwrap();
+        }
+        let mut should_exist = [true; 100];
+        for (begin, end) in ranges_to_delete {
+            db.range_delete::<TestSchema1, TestField>(&TestField(begin), &TestField(end)).unwrap();
+            for i in begin..end {
+                should_exist[i as usize] = false;
+            }
+        }
+
+        for (i, should_exist) in should_exist.iter().enumerate() {
+            assert_eq!(
+                db.get::<TestSchema1>(&TestField(i as u32)).unwrap().is_some(),
+                *should_exist,
+            )
+        }
+    }
+}
+
 fn collect_values<S: Schema>(db: &TestDB) -> Vec<(S::Key, S::Value)> {
     let mut iter = db
         .iter::<S>(Default::default())
         .expect("Failed to create iterator.");
-    iter.seek_to_first();
+    iter.seek_to_first().unwrap();
     iter.collect::<Result<Vec<_>>>().unwrap()
 }
 
@@ -253,7 +283,7 @@ fn test_two_schema_batches() {
 
 #[test]
 fn test_reopen() {
-    let tmpdir = tempfile::tempdir().expect("Failed to create temporary directory.");
+    let tmpdir = libra_temppath::TempPath::new();
     {
         let db = open_db(&tmpdir);
         db.put::<TestSchema1>(&TestField(0), &TestField(0)).unwrap();
@@ -269,4 +299,27 @@ fn test_reopen() {
             Some(TestField(0)),
         );
     }
+}
+
+#[test]
+fn test_report_size() {
+    let db = TestDB::new();
+
+    for i in 0..1000 {
+        let mut db_batch = SchemaBatch::new();
+        db_batch
+            .put::<TestSchema1>(&TestField(i), &TestField(i))
+            .unwrap();
+        db_batch
+            .put::<TestSchema2>(&TestField(i), &TestField(i))
+            .unwrap();
+        db.write_schemas(db_batch).unwrap();
+    }
+
+    db.flush_all(/* sync = */ true).unwrap();
+
+    let cf_sizes = db.get_approximate_sizes_cf().unwrap();
+    assert!(*cf_sizes.get("TestCF1").unwrap() > 0);
+    assert!(*cf_sizes.get("TestCF2").unwrap() > 0);
+    assert_eq!(*cf_sizes.get("default").unwrap(), 0);
 }

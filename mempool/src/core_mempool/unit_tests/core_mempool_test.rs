@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::core_mempool::{
-    unit_tests::common::{add_txn, add_txns_to_mempool, setup_mempool, TestTransaction},
-    CoreMempool, MempoolAddTransactionStatus, TimelineState,
+    unit_tests::common::{
+        add_signed_txn, add_txn, add_txns_to_mempool, exist_in_metrics_cache, setup_mempool,
+        TestTransaction,
+    },
+    CoreMempool, TimelineState,
 };
-use config::config::NodeConfigHelpers;
+use libra_config::config::NodeConfig;
+use libra_types::transaction::SignedTransaction;
 use std::{collections::HashSet, time::Duration};
-use types::transaction::SignedTransaction;
 
 #[test]
 fn test_transaction_ordering() {
@@ -60,6 +63,18 @@ fn test_transaction_ordering() {
 }
 
 #[test]
+fn test_metric_cache_add_local_txns() {
+    let (mut mempool, _) = setup_mempool();
+    let txns = add_txns_to_mempool(
+        &mut mempool,
+        vec![TestTransaction::new(0, 0, 1), TestTransaction::new(1, 0, 2)],
+    );
+    // Check txns' timestamps exist in metrics_cache.
+    assert_eq!(exist_in_metrics_cache(&mempool, &txns[0]), true);
+    assert_eq!(exist_in_metrics_cache(&mempool, &txns[1]), true);
+}
+
+#[test]
 fn test_update_transaction_in_mempool() {
     let (mut mempool, mut consensus) = setup_mempool();
     let txns = add_txns_to_mempool(
@@ -74,6 +89,27 @@ fn test_update_transaction_in_mempool() {
         vec![fixed_txns[0].clone()]
     );
     assert_eq!(consensus.get_block(&mut mempool, 1), vec![txns[1].clone()]);
+}
+
+#[test]
+fn test_update_invalid_transaction_in_mempool() {
+    let (mut mempool, mut consensus) = setup_mempool();
+    let txns = add_txns_to_mempool(
+        &mut mempool,
+        vec![TestTransaction::new(0, 0, 1), TestTransaction::new(1, 0, 2)],
+    );
+    let updated_txn = TestTransaction::make_signed_transaction_with_max_gas_amount(
+        &TestTransaction::new(0, 0, 5),
+        200,
+    );
+    let _added_tnx = add_signed_txn(&mut mempool, updated_txn);
+
+    // since both gas price and mas gas amount were updated, the ordering should not have changed.
+    // the second transaction with gas price 2 should come first
+    assert_eq!(consensus.get_block(&mut mempool, 1), vec![txns[1].clone()]);
+    let next_tnx = consensus.get_block(&mut mempool, 1);
+    assert_eq!(next_tnx, vec![txns[0].clone()]);
+    assert_eq!(next_tnx[0].gas_unit_price(), 1);
 }
 
 #[test]
@@ -98,51 +134,10 @@ fn test_remove_transaction() {
 }
 
 #[test]
-fn test_balance_check() {
-    let mut pool = setup_mempool().0;
-    let address = 0;
-
-    let transaction1 = TestTransaction::new(address, 0, 1);
-    assert_eq!(
-        pool.add_txn(
-            transaction1.make_signed_transaction(),
-            1,
-            0,
-            2,
-            TimelineState::NotReady
-        ),
-        MempoolAddTransactionStatus::Valid
-    );
-
-    assert_eq!(
-        pool.add_txn(
-            TestTransaction::new(address, 1, 1).make_signed_transaction(),
-            10,
-            1,
-            5,
-            TimelineState::NotReady
-        ),
-        MempoolAddTransactionStatus::InsufficientBalance
-    );
-
-    // check that gas unit price is taking into account for balance check
-    assert_eq!(
-        pool.add_txn(
-            TestTransaction::new(address, 1, /* gas price */ 2).make_signed_transaction(),
-            /* gas amount */ 3,
-            1,
-            5,
-            TimelineState::NotReady
-        ),
-        MempoolAddTransactionStatus::InsufficientBalance
-    );
-}
-
-#[test]
 fn test_system_ttl() {
     // created mempool with system_transaction_timeout = 0
     // All transactions are supposed to be evicted on next gc run
-    let mut config = NodeConfigHelpers::get_single_node_test_config(true);
+    let mut config = NodeConfig::random();
     config.mempool.system_transaction_timeout_secs = 0;
     let mut mempool = CoreMempool::new(&config);
 
@@ -243,7 +238,7 @@ fn test_timeline() {
 
 #[test]
 fn test_capacity() {
-    let mut config = NodeConfigHelpers::get_single_node_test_config(true);
+    let mut config = NodeConfig::random();
     config.mempool.capacity = 1;
     config.mempool.system_transaction_timeout_secs = 0;
     let mut pool = CoreMempool::new(&config);
@@ -264,7 +259,7 @@ fn test_capacity() {
 
 #[test]
 fn test_parking_lot_eviction() {
-    let mut config = NodeConfigHelpers::get_single_node_test_config(true);
+    let mut config = NodeConfig::random();
     config.mempool.capacity = 5;
     let mut pool = CoreMempool::new(&config);
     // add transactions with following sequence numbers to Mempool
@@ -296,7 +291,7 @@ fn test_gc_ready_transaction() {
     // insert in the middle transaction that's going to be expired
     let txn = TestTransaction::new(1, 1, 1)
         .make_signed_transaction_with_expiration_time(Duration::from_secs(0));
-    pool.add_txn(txn, 0, 0, 100, TimelineState::NotReady);
+    pool.add_txn(txn, 0, 0, TimelineState::NotReady);
 
     // insert few transactions after it
     // They supposed to be ready because there's sequential path from 0 to them
@@ -318,4 +313,18 @@ fn test_gc_ready_transaction() {
     let (timeline, _) = pool.read_timeline(0, 10);
     assert_eq!(timeline.len(), 1);
     assert_eq!(timeline[0].sequence_number(), 0);
+}
+
+#[test]
+fn test_clean_stuck_transactions() {
+    let mut pool = setup_mempool().0;
+    for seq in 0..5 {
+        add_txn(&mut pool, TestTransaction::new(0, seq, 1)).unwrap();
+    }
+    let db_sequence_number = 10;
+    let txn = TestTransaction::new(0, db_sequence_number, 1).make_signed_transaction();
+    pool.add_txn(txn, 0, db_sequence_number, TimelineState::NotReady);
+    let block = pool.get_block(10, HashSet::new());
+    assert_eq!(block.len(), 1);
+    assert_eq!(block[0].sequence_number(), 10);
 }

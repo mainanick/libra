@@ -6,15 +6,20 @@
 use futures::{
     future::poll_fn,
     io::{AsyncRead, AsyncWrite},
-    ready, try_ready,
+    ready,
 };
-use logger::prelude::*;
+use libra_logger::prelude::*;
 use std::{
     convert::TryInto,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
+
+// Fuzzer for Noise
+#[cfg(any(feature = "fuzzing", test))]
+#[path = "noise_fuzzing.rs"]
+pub mod noise_fuzzing;
 
 const MAX_PAYLOAD_LENGTH: usize = u16::max_value() as usize; // 65535
 
@@ -69,7 +74,7 @@ enum ReadState {
     /// End of file reached, result indicated if EOF was expected or not
     Eof(Result<(), ()>),
     /// Decryption Error
-    DecryptionError(snow::SnowError),
+    DecryptionError(snow::error::Error),
 }
 
 /// Possible write states for a [NoiseSocket]
@@ -92,7 +97,57 @@ enum WriteState {
     /// End of file reached
     Eof,
     /// Encryption Error
-    EncryptionError(snow::SnowError),
+    EncryptionError(snow::error::Error),
+}
+
+/// Session mode for snow
+#[derive(Debug)]
+enum Session {
+    Handshake(Box<snow::HandshakeState>),
+    Transport(Box<snow::TransportState>),
+}
+
+impl Session {
+    pub fn is_initiator(&self) -> bool {
+        match self {
+            Session::Handshake(ref session) => session.is_initiator(),
+            Session::Transport(ref session) => session.is_initiator(),
+        }
+    }
+
+    pub fn read_message(
+        &mut self,
+        message: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, snow::error::Error> {
+        match self {
+            Session::Handshake(ref mut session) => session.read_message(message, payload),
+            Session::Transport(ref mut session) => session.read_message(message, payload),
+        }
+    }
+
+    pub fn write_message(
+        &mut self,
+        message: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, snow::error::Error> {
+        match self {
+            Session::Handshake(ref mut session) => session.write_message(message, payload),
+            Session::Transport(ref mut session) => session.write_message(message, payload),
+        }
+    }
+
+    pub fn into_transport_mode(self) -> Result<snow::TransportState, io::Error> {
+        match self {
+            Session::Handshake(session) => session
+                .into_transport_mode()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Noise error: {}", e))),
+            Session::Transport(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Session not in handshake state".to_string(),
+            )),
+        }
+    }
 }
 
 /// A Noise session with a remote
@@ -103,17 +158,17 @@ enum WriteState {
 #[derive(Debug)]
 pub struct NoiseSocket<TSocket> {
     socket: TSocket,
-    session: snow::Session,
+    session: Session,
     buffers: Box<NoiseBuffers>,
     read_state: ReadState,
     write_state: WriteState,
 }
 
 impl<TSocket> NoiseSocket<TSocket> {
-    fn new(socket: TSocket, session: snow::Session) -> Self {
+    fn new(socket: TSocket, session: snow::HandshakeState) -> Self {
         Self {
             socket,
-            session,
+            session: Session::Handshake(Box::new(session)),
             buffers: Box::new(NoiseBuffers::new()),
             read_state: ReadState::Init,
             write_state: WriteState::Init,
@@ -122,7 +177,10 @@ impl<TSocket> NoiseSocket<TSocket> {
 
     /// Pull out the static public key of the remote
     pub fn get_remote_static(&self) -> Option<&[u8]> {
-        self.session.get_remote_static()
+        match self.session {
+            Session::Handshake(ref session) => session.get_remote_static(),
+            Session::Transport(ref session) => session.get_remote_static(),
+        }
     }
 }
 
@@ -447,7 +505,7 @@ where
                     }
                 }
                 WriteState::Flush => {
-                    try_ready!(Pin::new(&mut self.socket).poll_flush(&mut context));
+                    ready!(Pin::new(&mut self.socket).poll_flush(&mut context))?;
                     self.write_state = WriteState::Init;
                 }
                 WriteState::Eof => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
@@ -462,7 +520,7 @@ where
     }
 
     fn poll_write(&mut self, context: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if let Some(bytes_written) = try_ready!(self.poll_write_or_flush(context, Some(buf))) {
+        if let Some(bytes_written) = ready!(self.poll_write_or_flush(context, Some(buf)))? {
             Poll::Ready(Ok(bytes_written))
         } else {
             unreachable!();
@@ -470,7 +528,7 @@ where
     }
 
     fn poll_flush(&mut self, context: &mut Context) -> Poll<io::Result<()>> {
-        if try_ready!(self.poll_write_or_flush(context, None)).is_none() {
+        if ready!(self.poll_write_or_flush(context, None))?.is_none() {
             Poll::Ready(Ok(()))
         } else {
             unreachable!();
@@ -503,8 +561,8 @@ where
 pub(super) struct Handshake<TSocket>(NoiseSocket<TSocket>);
 
 impl<TSocket> Handshake<TSocket> {
-    /// Build a new `Handshake` struct given a socket and a new snow Session
-    pub fn new(socket: TSocket, session: snow::Session) -> Self {
+    /// Build a new `Handshake` struct given a socket and a new snow HandshakeState
+    pub fn new(socket: TSocket, session: snow::HandshakeState) -> Self {
         let noise_socket = NoiseSocket::new(socket, session);
         Self(noise_socket)
     }
@@ -560,12 +618,11 @@ where
     ///
     /// Converts the noise session into transport mode and returns the NoiseSocket.
     fn finish(self) -> io::Result<NoiseSocket<TSocket>> {
-        let session = self
-            .0
-            .session
-            .into_transport_mode()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Noise error: {}", e)))?;
-        Ok(NoiseSocket { session, ..self.0 })
+        let session = self.0.session.into_transport_mode()?;
+        Ok(NoiseSocket {
+            session: Session::Transport(Box::new(session)),
+            ..self.0
+        })
     }
 }
 
@@ -573,7 +630,7 @@ where
 mod test {
     use crate::{
         socket::{Handshake, NoiseSocket, MAX_PAYLOAD_LENGTH},
-        NOISE_IX_PARAMETER,
+        NOISE_PARAMETER,
     };
     use futures::{
         executor::block_on,
@@ -581,7 +638,7 @@ mod test {
         io::{AsyncReadExt, AsyncWriteExt},
     };
     use memsocket::MemorySocket;
-    use snow::{params::NoiseParams, Builder, Keypair, SnowError};
+    use snow::{params::NoiseParams, Builder, Keypair};
     use std::io;
 
     fn build_test_connection() -> Result<
@@ -589,9 +646,9 @@ mod test {
             (Keypair, Handshake<MemorySocket>),
             (Keypair, Handshake<MemorySocket>),
         ),
-        SnowError,
+        snow::error::Error,
     > {
-        let parameters: NoiseParams = NOISE_IX_PARAMETER.parse().expect("Invalid protocol name");
+        let parameters: NoiseParams = NOISE_PARAMETER.parse().expect("Invalid protocol name");
 
         let dialer_keypair = Builder::new(parameters.clone()).generate_keypair()?;
         let listener_keypair = Builder::new(parameters.clone()).generate_keypair()?;
@@ -599,7 +656,7 @@ mod test {
         let dialer_session = Builder::new(parameters.clone())
             .local_private_key(&dialer_keypair.private)
             .build_initiator()?;
-        let listener_session = Builder::new(parameters.clone())
+        let listener_session = Builder::new(parameters)
             .local_private_key(&listener_keypair.private)
             .build_responder()?;
 

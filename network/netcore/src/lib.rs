@@ -7,9 +7,8 @@
 //! network from building `Transport`s and `StreamMultiplexer`s to negotiating protocols on a
 //! socket.
 
-#![feature(async_await)]
-
+pub mod compat;
+pub mod framing;
 pub mod multiplexing;
 pub mod negotiate;
 pub mod transport;
-mod utils;

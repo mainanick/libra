@@ -1,41 +1,38 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    chained_bft::{
-        common::Author,
-        consensus_types::{block::Block, quorum_cert::QuorumCert},
-        liveness::proposer_election::ProposalInfo,
-        network::{BlockRetrievalResponse, ConsensusNetworkImpl, NetworkReceivers},
-        safety::vote_msg::VoteMsg,
-        test_utils::{consensus_runtime, placeholder_ledger_info},
+use crate::chained_bft::{
+    network::{NetworkReceivers, NetworkSender},
+    network_interface::{
+        ConsensusMsg, ConsensusNetworkEvents, ConsensusNetworkSender,
+        CONSENSUS_DIRECT_SEND_PROTOCOL, CONSENSUS_RPC_PROTOCOL,
     },
-    state_replication::ExecutedState,
+    test_utils::{self, consensus_runtime, placeholder_ledger_info},
 };
-use channel;
-use crypto::{signing::generate_keypair, HashValue};
-use futures::{channel::mpsc, executor::block_on, FutureExt, SinkExt, StreamExt, TryFutureExt};
+use channel::{self, libra_channel, message_queues::QueueStyle};
+use consensus_types::{
+    block::{block_test_utils::certificate_for_genesis, Block},
+    common::{Author, Payload},
+    proposal_msg::ProposalMsg,
+    sync_info::SyncInfo,
+    vote::Vote,
+    vote_data::VoteData,
+    vote_msg::VoteMsg,
+};
+use futures::{channel::mpsc, executor::block_on, SinkExt, StreamExt};
+use libra_types::{block_info::BlockInfo, PeerId};
 use network::{
-    interface::{NetworkNotification, NetworkRequest},
-    proto::{BlockRetrievalStatus, ConsensusMsg, QuorumCert as ProtoQuorumCert, RequestChunk},
+    peer_manager::{conn_status_channel, PeerManagerNotification, PeerManagerRequest},
     protocols::rpc::InboundRpcRequest,
-    validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender},
+    ProtocolId,
 };
-use proto_conv::FromProto;
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
-use tokio::runtime::TaskExecutor;
-use types::{
-    account_address::AccountAddress,
-    proto::ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    test_helpers::transaction_test_helpers::get_test_signed_txn,
-    transaction::{SignedTransaction, TransactionInfo, TransactionListWithProof},
-    validator_signer::ValidatorSigner,
-    validator_verifier::ValidatorVerifier,
-};
+use tokio::runtime::Handle;
 
 /// `NetworkPlayground` mocks the network implementation and provides convenience
 /// methods for testing. Test clients can use `wait_for_messages` or
@@ -49,20 +46,24 @@ pub struct NetworkPlayground {
     /// Maps each Author to a Sender of their inbound network notifications.
     /// These events will usually be handled by the event loop spawned in
     /// `ConsensusNetworkImpl`.
-    node_consensus_txs: Arc<Mutex<HashMap<Author, channel::Sender<NetworkNotification>>>>,
+    node_consensus_txs: Arc<
+        Mutex<
+            HashMap<Author, libra_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>>,
+        >,
+    >,
     /// Nodes' outbound handlers forward their outbound non-rpc messages to this
     /// queue.
-    outbound_msgs_tx: mpsc::Sender<(Author, NetworkRequest)>,
+    outbound_msgs_tx: mpsc::Sender<(Author, PeerManagerRequest)>,
     /// NetworkPlayground reads all nodes' outbound messages through this queue.
-    outbound_msgs_rx: mpsc::Receiver<(Author, NetworkRequest)>,
+    outbound_msgs_rx: mpsc::Receiver<(Author, PeerManagerRequest)>,
     /// Allow test code to drop direct-send messages between peers.
     drop_config: Arc<RwLock<DropConfig>>,
     /// An executor for spawning node outbound network event handlers
-    executor: TaskExecutor,
+    executor: Handle,
 }
 
 impl NetworkPlayground {
-    pub fn new(executor: TaskExecutor) -> Self {
+    pub fn new(executor: Handle) -> Self {
         let (outbound_msgs_tx, outbound_msgs_rx) = mpsc::channel(1_024);
 
         NetworkPlayground {
@@ -85,9 +86,16 @@ impl NetworkPlayground {
     async fn start_node_outbound_handler(
         drop_config: Arc<RwLock<DropConfig>>,
         src: Author,
-        mut network_reqs_rx: channel::Receiver<NetworkRequest>,
-        mut outbound_msgs_tx: mpsc::Sender<(Author, NetworkRequest)>,
-        node_consensus_txs: Arc<Mutex<HashMap<Author, channel::Sender<NetworkNotification>>>>,
+        mut network_reqs_rx: libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerRequest>,
+        mut outbound_msgs_tx: mpsc::Sender<(Author, PeerManagerRequest)>,
+        node_consensus_txs: Arc<
+            Mutex<
+                HashMap<
+                    Author,
+                    libra_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>,
+                >,
+            >,
+        >,
     ) {
         while let Some(net_req) = network_reqs_rx.next().await {
             let drop_rpc = drop_config
@@ -105,14 +113,14 @@ impl NetworkPlayground {
                 // but because the rpc call blocks and depends on the message
                 // delivery, we'd have to spawn the sending behaviour on a
                 // separate task, which is inconvenient.
-                NetworkRequest::SendRpc(dst, outbound_req) => {
+                PeerManagerRequest::SendRpc(dst, outbound_req) => {
                     if drop_rpc {
                         continue;
                     }
                     let mut node_consensus_tx = node_consensus_txs
                         .lock()
                         .unwrap()
-                        .get(&dst.into())
+                        .get(&dst)
                         .unwrap()
                         .clone();
 
@@ -123,11 +131,13 @@ impl NetworkPlayground {
                     };
 
                     node_consensus_tx
-                        .send(NetworkNotification::RecvRpc(src.into(), inbound_req))
-                        .await
+                        .push(
+                            (src, ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL)),
+                            PeerManagerNotification::RecvRpc(src, inbound_req),
+                        )
                         .unwrap();
                 }
-                // Other NetworkRequest get buffered for `deliver_messages` to
+                // Other PeerManagerRequest get buffered for `deliver_messages` to
                 // synchronously drain.
                 net_req => {
                     let _ = outbound_msgs_tx.send((src, net_req)).await;
@@ -142,11 +152,12 @@ impl NetworkPlayground {
         author: Author,
         // The `Sender` of inbound network events. The `Receiver` end of this
         // queue is usually wrapped in a `ConsensusNetworkEvents` adapter.
-        consensus_tx: channel::Sender<NetworkNotification>,
+        consensus_tx: libra_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>,
         // The `Receiver` of outbound network events this node sends. The
         // `Sender` side of this queue is usually wrapped in a
         // `ConsensusNetworkSender` adapter.
-        network_reqs_rx: channel::Receiver<NetworkRequest>,
+        network_reqs_rx: libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerRequest>,
+        conn_mgr_reqs_rx: channel::Receiver<network::ConnectivityRequest>,
     ) {
         self.node_consensus_txs
             .lock()
@@ -154,27 +165,31 @@ impl NetworkPlayground {
             .insert(author, consensus_tx);
         self.drop_config.write().unwrap().add_node(author);
 
-        let fut = NetworkPlayground::start_node_outbound_handler(
+        let fut1 = NetworkPlayground::start_node_outbound_handler(
             Arc::clone(&self.drop_config),
             author,
             network_reqs_rx,
             self.outbound_msgs_tx.clone(),
             self.node_consensus_txs.clone(),
         );
-        self.executor.spawn(fut.boxed().unit_error().compat());
+        let fut2 = conn_mgr_reqs_rx.map(Ok).forward(::futures::sink::drain());
+        self.executor.spawn(futures::future::join(fut1, fut2));
     }
 
-    /// Deliver a `NetworkRequest` from peer `src` to the destination peer.
+    /// Deliver a `PeerManagerRequest` from peer `src` to the destination peer.
     /// Returns a copy of the delivered message and the sending peer id.
-    async fn deliver_message(
+    async fn deliver_message<T: Payload>(
         &mut self,
         src: Author,
-        msg: NetworkRequest,
-    ) -> (Author, ConsensusMsg) {
+        msg: PeerManagerRequest,
+    ) -> (Author, ConsensusMsg<T>) {
         // extract destination peer
         let dst = match &msg {
-            NetworkRequest::SendMessage(dst, _) => *dst,
-            msg => panic!("[network playground] Unexpected NetworkRequest: {:?}", msg),
+            PeerManagerRequest::SendMessage(dst, _) => *dst,
+            msg => panic!(
+                "[network playground] Unexpected PeerManagerRequest: {:?}",
+                msg
+            ),
         };
 
         // get his sender
@@ -182,31 +197,39 @@ impl NetworkPlayground {
             .node_consensus_txs
             .lock()
             .unwrap()
-            .get(&dst.into())
+            .get(&dst)
             .unwrap()
             .clone();
 
-        // convert NetworkRequest to corresponding NetworkNotification
+        // convert PeerManagerRequest to corresponding PeerManagerNotification
         let msg_notif = match msg {
-            NetworkRequest::SendMessage(_dst, msg) => {
-                NetworkNotification::RecvMessage(src.into(), msg)
+            PeerManagerRequest::SendMessage(_dst, msg) => {
+                PeerManagerNotification::RecvMessage(src, msg)
             }
-            msg => panic!("[network playground] Unexpected NetworkRequest: {:?}", msg),
+            msg => panic!(
+                "[network playground] Unexpected PeerManagerRequest: {:?}",
+                msg
+            ),
         };
 
         // copy message data
         let msg_copy = match &msg_notif {
-            NetworkNotification::RecvMessage(src, msg) => {
-                let msg: ConsensusMsg = ::protobuf::parse_from_bytes(msg.mdata.as_ref()).unwrap();
-                ((*src).into(), msg)
+            PeerManagerNotification::RecvMessage(src, msg) => {
+                let msg: ConsensusMsg<T> = lcs::from_bytes(&msg.mdata).unwrap();
+                (*src, msg)
             }
             msg_notif => panic!(
-                "[network playground] Unexpected NetworkNotification: {:?}",
+                "[network playground] Unexpected PeerManagerNotification: {:?}",
                 msg_notif
             ),
         };
 
-        node_consensus_tx.send(msg_notif).await.unwrap();
+        node_consensus_tx
+            .push(
+                (src, ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL)),
+                msg_notif,
+            )
+            .unwrap();
         msg_copy
     }
 
@@ -214,13 +237,13 @@ impl NetworkPlayground {
     /// copy of all messages for verification.
     /// While all the sent messages are delivered, only the messages that satisfy the given
     /// msg inspector are counted.
-    pub async fn wait_for_messages<F>(
+    pub async fn wait_for_messages<T: Payload, F>(
         &mut self,
         num_messages: usize,
         msg_inspector: F,
-    ) -> Vec<(Author, ConsensusMsg)>
+    ) -> Vec<(Author, ConsensusMsg<T>)>
     where
-        F: Fn(&(Author, ConsensusMsg)) -> bool,
+        F: Fn(&(Author, ConsensusMsg<T>)) -> bool,
     {
         let mut msg_copies = vec![];
         while msg_copies.len() < num_messages {
@@ -241,31 +264,56 @@ impl NetworkPlayground {
     }
 
     /// Returns true for any message
-    pub fn take_all(_msg_copy: &(Author, ConsensusMsg)) -> bool {
+    pub fn take_all<T>(_msg_copy: &(Author, ConsensusMsg<T>)) -> bool {
         true
     }
 
-    /// Returns true for any message other than new round
-    pub fn exclude_new_round(msg_copy: &(Author, ConsensusMsg)) -> bool {
-        !msg_copy.1.has_new_round()
+    /// Returns true for any message other than timeout
+    pub fn exclude_timeout_msg<T>(msg_copy: &(Author, ConsensusMsg<T>)) -> bool {
+        !Self::timeout_votes_only(msg_copy)
     }
 
     /// Returns true for proposal messages only.
-    pub fn proposals_only(msg_copy: &(Author, ConsensusMsg)) -> bool {
-        msg_copy.1.has_proposal()
+    pub fn proposals_only<T>(msg: &(Author, ConsensusMsg<T>)) -> bool {
+        match &msg.1 {
+            ConsensusMsg::ProposalMsg(_) => true,
+            _ => false,
+        }
     }
 
     /// Returns true for vote messages only.
-    pub fn votes_only(msg_copy: &(Author, ConsensusMsg)) -> bool {
-        msg_copy.1.has_vote()
+    pub fn votes_only<T>(msg: &(Author, ConsensusMsg<T>)) -> bool {
+        match &msg.1 {
+            ConsensusMsg::VoteMsg(_) => true,
+            _ => false,
+        }
     }
 
-    /// Returns true for new round messages only.
-    pub fn new_round_only(msg_copy: &(Author, ConsensusMsg)) -> bool {
-        msg_copy.1.has_new_round()
+    /// Returns true for vote messages that carry round signatures only.
+    pub fn timeout_votes_only<T>(msg: &(Author, ConsensusMsg<T>)) -> bool {
+        match &msg.1 {
+            // Timeout votes carry non-empty round signatures.
+            ConsensusMsg::VoteMsg(vote_msg) => vote_msg.vote().timeout_signature().is_some(),
+            _ => false,
+        }
     }
 
-    fn is_message_dropped(&self, src: &Author, net_req: &NetworkRequest) -> bool {
+    /// Returns true for sync info messages only.
+    pub fn sync_info_only<T>(msg: &(Author, ConsensusMsg<T>)) -> bool {
+        match &msg.1 {
+            ConsensusMsg::SyncInfo(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn epoch_change_only<T>(msg: &(Author, ConsensusMsg<T>)) -> bool {
+        match &msg.1 {
+            ConsensusMsg::ValidatorChangeProof(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_message_dropped(&self, src: &Author, net_req: &PeerManagerRequest) -> bool {
         self.drop_config
             .read()
             .unwrap()
@@ -287,18 +335,10 @@ impl NetworkPlayground {
 struct DropConfig(HashMap<Author, HashSet<Author>>);
 
 impl DropConfig {
-    pub fn is_message_dropped(&self, src: &Author, net_req: &NetworkRequest) -> bool {
+    pub fn is_message_dropped(&self, src: &Author, net_req: &PeerManagerRequest) -> bool {
         match net_req {
-            NetworkRequest::SendMessage(dst, _) => self
-                .0
-                .get(src.into())
-                .unwrap()
-                .contains(&Author::from(*dst)),
-            NetworkRequest::SendRpc(dst, _) => self
-                .0
-                .get(src.into())
-                .unwrap()
-                .contains(&Author::from(*dst)),
+            PeerManagerRequest::SendMessage(dst, _) => self.0.get(src).unwrap().contains(&dst),
+            PeerManagerRequest::SendRpc(dst, _) => self.0.get(src).unwrap().contains(&dst),
             _ => true,
         }
     }
@@ -316,76 +356,80 @@ impl DropConfig {
     }
 }
 
+use crate::chained_bft::{network::NetworkTask, test_utils::TestPayload};
+use consensus_types::block_retrieval::{
+    BlockRetrievalRequest, BlockRetrievalResponse, BlockRetrievalStatus,
+};
+use libra_crypto::HashValue;
+#[cfg(test)]
+use libra_types::crypto_proxies::random_validator_verifier;
+
 #[test]
 fn test_network_api() {
     let runtime = consensus_runtime();
     let num_nodes = 5;
-    let mut peers = Vec::new();
-    let mut receivers: Vec<NetworkReceivers<u64, Author>> = Vec::new();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut receivers: Vec<NetworkReceivers<TestPayload>> = Vec::new();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let mut nodes = Vec::new();
-    let mut author_to_public_keys = HashMap::new();
-    let mut signers = Vec::new();
-    for _ in 0..num_nodes {
-        let random_validator_signer = ValidatorSigner::random();
-        author_to_public_keys.insert(
-            random_validator_signer.author(),
-            random_validator_signer.public_key(),
-        );
-        peers.push(random_validator_signer.author());
-        signers.push(random_validator_signer);
-    }
-    let validator = Arc::new(ValidatorVerifier::new(
-        author_to_public_keys,
-        peers.len() * 2 / 3 + 1,
-    ));
-    for i in 0..num_nodes {
-        let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
-        let (consensus_tx, consensus_rx) = channel::new_test(8);
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx);
-        let network_events = ConsensusNetworkEvents::new(consensus_rx);
+    let (signers, validator_verifier) = random_validator_verifier(num_nodes, None, false);
+    let peers: Vec<_> = signers.iter().map(|signer| signer.author()).collect();
+    let validators = Arc::new(validator_verifier);
+    for peer in &peers {
+        let (network_reqs_tx, network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (consensus_tx, consensus_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
+        let (_, conn_status_rx) = conn_status_channel::new();
+        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
 
-        playground.add_node(peers[i], consensus_tx, network_reqs_rx);
-        let mut node = ConsensusNetworkImpl::new(
-            peers[i],
-            network_sender,
-            network_events,
-            Arc::new(peers.clone()),
-            Arc::clone(&validator),
-        );
-        receivers.push(node.start(&runtime.executor()));
+        playground.add_node(*peer, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
+        let (self_sender, self_receiver) = channel::new_test(8);
+        let node = NetworkSender::new(*peer, network_sender, self_sender, Arc::clone(&validators));
+        let (task, receiver) = NetworkTask::new(network_events, self_receiver);
+        receivers.push(receiver);
+        runtime.handle().spawn(task.start());
         nodes.push(node);
     }
-    let vote = VoteMsg::new(
-        HashValue::random(),
-        ExecutedState::state_for_genesis(),
-        1,
-        peers[0],
-        placeholder_ledger_info(),
-        &signers[0],
+    let vote_msg = VoteMsg::new(
+        Vote::new(
+            VoteData::new(BlockInfo::random(1), BlockInfo::random(0)),
+            peers[0],
+            placeholder_ledger_info(),
+            &signers[0],
+        ),
+        test_utils::placeholder_sync_info(),
     );
-    let proposal = ProposalInfo {
-        proposal: Block::make_genesis_block(),
-        proposer_info: ValidatorSigner::genesis().author(),
-        timeout_certificate: None,
-        highest_ledger_info: QuorumCert::certificate_for_genesis(),
-    };
+    let previous_qc = certificate_for_genesis();
+    let proposal = ProposalMsg::new(
+        Block::new_proposal(vec![0], 1, 1, previous_qc.clone(), &signers[0]),
+        SyncInfo::new(previous_qc.clone(), previous_qc, None),
+    );
     block_on(async move {
-        nodes[0].send_vote(vote.clone(), peers[2..5].to_vec()).await;
+        nodes[0]
+            .send_vote(vote_msg.clone(), peers[2..5].to_vec())
+            .await;
         playground
-            .wait_for_messages(3, NetworkPlayground::take_all)
+            .wait_for_messages(3, NetworkPlayground::take_all::<TestPayload>)
             .await;
         for r in receivers.iter_mut().take(5).skip(2) {
-            let v = r.votes.next().await.unwrap();
-            assert_eq!(v, vote);
+            let (_, msg) = r.consensus_messages.next().await.unwrap();
+            match msg {
+                ConsensusMsg::VoteMsg(v) => assert_eq!(*v, vote_msg),
+                _ => panic!("unexpected messages"),
+            }
         }
-        nodes[4].broadcast_proposal(proposal.clone()).await;
+        nodes[0].broadcast_proposal(proposal.clone()).await;
         playground
-            .wait_for_messages(4, NetworkPlayground::take_all)
+            .wait_for_messages(4, NetworkPlayground::take_all::<TestPayload>)
             .await;
         for r in receivers.iter_mut().take(num_nodes - 1) {
-            let p = r.proposals.next().await.unwrap();
-            assert_eq!(p, proposal);
+            let (_, msg) = r.consensus_messages.next().await.unwrap();
+            match msg {
+                ConsensusMsg::ProposalMsg(p) => assert_eq!(*p, proposal),
+                _ => panic!("unexpected messages"),
+            }
         }
     });
 }
@@ -394,129 +438,82 @@ fn test_network_api() {
 fn test_rpc() {
     let runtime = consensus_runtime();
     let num_nodes = 2;
-    let mut peers = Arc::new(Vec::new());
     let mut senders = Vec::new();
-    let mut receivers: Vec<NetworkReceivers<u64, Author>> = Vec::new();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut receivers: Vec<NetworkReceivers<TestPayload>> = Vec::new();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let mut nodes = Vec::new();
-    let mut author_to_public_keys = HashMap::new();
-    for _ in 0..num_nodes {
-        let random_validator_signer = ValidatorSigner::random();
-        author_to_public_keys.insert(
-            random_validator_signer.author(),
-            random_validator_signer.public_key(),
-        );
-        Arc::get_mut(&mut peers)
-            .unwrap()
-            .push(random_validator_signer.author());
-    }
-    let validator = Arc::new(ValidatorVerifier::new(
-        author_to_public_keys,
-        peers.len() * 2 / 3 + 1,
-    ));
-    for i in 0..num_nodes {
-        let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
-        let (consensus_tx, consensus_rx) = channel::new_test(8);
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx);
-        let network_events = ConsensusNetworkEvents::new(consensus_rx);
+    let (signers, validator_verifier) = random_validator_verifier(num_nodes, None, false);
+    let validators = Arc::new(validator_verifier);
+    let peers: Vec<_> = signers.iter().map(|signer| signer.author()).collect();
+    for peer in peers.iter() {
+        let (network_reqs_tx, network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (consensus_tx, consensus_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
+        let (_, conn_status_rx) = conn_status_channel::new();
+        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
 
-        playground.add_node(peers[i], consensus_tx, network_reqs_rx);
-        let mut node = ConsensusNetworkImpl::new(
-            peers[i],
+        playground.add_node(*peer, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
+        let (self_sender, self_receiver) = channel::new_test(8);
+        let node = NetworkSender::<TestPayload>::new(
+            *peer,
             network_sender.clone(),
-            network_events,
-            Arc::clone(&peers),
-            Arc::clone(&validator),
+            self_sender,
+            Arc::clone(&validators),
         );
+        let (task, receiver) = NetworkTask::new(network_events, self_receiver);
         senders.push(network_sender);
-        receivers.push(node.start(&runtime.executor()));
+        receivers.push(receiver);
+        runtime.handle().spawn(task.start());
         nodes.push(node);
     }
     let receiver_1 = receivers.remove(1);
-    let genesis = Arc::new(Block::<u64>::make_genesis_block());
-    let genesis_clone = Arc::clone(&genesis);
+    let node0 = nodes[0].clone();
+    let peer1 = peers[1];
+    let vote_msg = VoteMsg::new(
+        Vote::new(
+            VoteData::new(BlockInfo::random(1), BlockInfo::random(0)),
+            peers[0],
+            placeholder_ledger_info(),
+            &signers[0],
+        ),
+        test_utils::placeholder_sync_info(),
+    );
 
     // verify request block rpc
     let mut block_retrieval = receiver_1.block_retrieval;
     let on_request_block = async move {
         while let Some(request) = block_retrieval.next().await {
-            request
-                .response_sender
-                .send(BlockRetrievalResponse {
-                    status: BlockRetrievalStatus::SUCCEEDED,
-                    blocks: vec![Block::clone(genesis_clone.as_ref())],
-                })
-                .unwrap();
+            // make sure the network task is not blocked during RPC
+            // we limit the network notification queue size to 1 so if it's blocked,
+            // we can not process 2 votes and the test will timeout
+            node0.send_vote(vote_msg.clone(), vec![peer1]).await;
+            node0.send_vote(vote_msg.clone(), vec![peer1]).await;
+            playground
+                .wait_for_messages(2, NetworkPlayground::votes_only::<TestPayload>)
+                .await;
+            let response = BlockRetrievalResponse::<TestPayload>::new(
+                BlockRetrievalStatus::IdNotFound,
+                vec![],
+            );
+            let response = ConsensusMsg::BlockRetrievalResponse(Box::new(response));
+            let bytes = lcs::to_bytes(&response).unwrap();
+            request.response_sender.send(Ok(bytes.into())).unwrap();
         }
     };
-    runtime
-        .executor()
-        .spawn(on_request_block.boxed().unit_error().compat());
+    runtime.handle().spawn(on_request_block);
     let peer = peers[1];
     block_on(async move {
         let response = nodes[0]
-            .request_block(genesis.id(), 1, peer, Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(response.blocks[0], *genesis);
-    });
-
-    // verify request chunk rpc
-    let mut chunk_retrieval = receiver_1.chunk_retrieval;
-    let on_request_chunk = async move {
-        while let Some(request) = chunk_retrieval.next().await {
-            let keypair = generate_keypair();
-            let proto_txn =
-                get_test_signed_txn(AccountAddress::random(), 0, keypair.0, keypair.1, None);
-            let txn = SignedTransaction::from_proto(proto_txn).unwrap();
-            let info =
-                TransactionInfo::new(HashValue::zero(), HashValue::zero(), HashValue::zero(), 0);
-            request
-                .response_sender
-                .send(Ok(TransactionListWithProof::new(
-                    vec![(txn, info)],
-                    None,
-                    None,
-                    None,
-                    None,
-                )))
-                .unwrap();
-        }
-    };
-    runtime
-        .executor()
-        .spawn(on_request_chunk.boxed().unit_error().compat());
-
-    block_on(async move {
-        let mut ledger_info = LedgerInfo::new();
-        ledger_info.set_transaction_accumulator_hash(HashValue::zero().to_vec());
-        ledger_info.set_consensus_block_id(HashValue::zero().to_vec());
-        ledger_info.set_consensus_data_hash(
-            VoteMsg::vote_digest(
-                HashValue::zero(),
-                ExecutedState {
-                    state_id: HashValue::zero(),
-                    version: 0,
-                },
-                0,
+            .request_block(
+                BlockRetrievalRequest::new(HashValue::zero(), 1),
+                peer,
+                Duration::from_secs(5),
             )
-            .to_vec(),
-        );
-        let mut ledger_info_with_sigs = LedgerInfoWithSignatures::new();
-        ledger_info_with_sigs.set_ledger_info(ledger_info);
-        let mut target = ProtoQuorumCert::new();
-        target.set_block_id(HashValue::zero().into());
-        target.set_state_id(HashValue::zero().into());
-        target.set_round(0);
-        target.set_signed_ledger_info(ledger_info_with_sigs);
-        let mut req = RequestChunk::new();
-        req.set_start_version(0);
-        req.set_batch_size(1);
-        req.set_target(target);
-        let chunk = senders[0]
-            .request_chunk(peers[1], req, Duration::from_secs(5))
             .await
             .unwrap();
-        assert_eq!(chunk.get_txn_list_with_proof().get_transactions().len(), 1);
+        assert_eq!(response.status(), BlockRetrievalStatus::IdNotFound);
     });
 }

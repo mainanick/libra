@@ -1,13 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![feature(never_type)]
-#![feature(exhaustive_patterns)]
+#![forbid(unsafe_code)]
+
+#[macro_use]
+extern crate mirai_annotations;
 
 use std::fmt;
 
 pub mod access;
-pub mod checks;
+pub mod check_bounds;
 #[macro_use]
 pub mod errors;
 pub mod deserializer;
@@ -16,6 +18,7 @@ pub mod file_format_common;
 pub mod gas_schedule;
 pub mod internals;
 pub mod printers;
+#[cfg(any(test, feature = "fuzzing"))]
 pub mod proptest_types;
 pub mod resolver;
 pub mod serializer;
@@ -39,11 +42,12 @@ pub enum IndexKind {
     TypeSignature,
     FunctionSignature,
     LocalsSignature,
-    StringPool,
+    Identifier,
     ByteArrayPool,
     AddressPool,
     LocalPool,
     CodeDefinition,
+    TypeParameter,
 }
 
 impl IndexKind {
@@ -52,6 +56,7 @@ impl IndexKind {
 
         // XXX ensure this list stays up to date!
         &[
+            ByteArrayPool,
             ModuleHandle,
             StructHandle,
             FunctionHandle,
@@ -61,10 +66,11 @@ impl IndexKind {
             TypeSignature,
             FunctionSignature,
             LocalsSignature,
-            StringPool,
+            Identifier,
             AddressPool,
             LocalPool,
             CodeDefinition,
+            TypeParameter,
         ]
     }
 }
@@ -83,17 +89,19 @@ impl fmt::Display for IndexKind {
             TypeSignature => "type signature",
             FunctionSignature => "function signature",
             LocalsSignature => "locals signature",
-            StringPool => "string pool",
+            Identifier => "identifier",
             ByteArrayPool => "byte_array pool",
             AddressPool => "address pool",
             LocalPool => "local pool",
             CodeDefinition => "code definition pool",
+            TypeParameter => "type parameter",
         };
 
         f.write_str(desc)
     }
 }
 
+// TODO: is this outdated?
 /// Represents the kind of a signature token.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SignatureTokenKind {

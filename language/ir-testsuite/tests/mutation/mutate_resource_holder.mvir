@@ -1,0 +1,24 @@
+module A {
+    import 0x0.LibraCoin;
+    resource A { c: LibraCoin.T }
+    public new(c: LibraCoin.T): Self.A {
+        return A { c: move(c) };
+    }
+    public destroy_a(a: Self.A) {
+        let c: LibraCoin.T;
+        A { c } = move(a);
+        LibraCoin.destroy_zero(move(c));
+        return;
+    }
+    public mutate(a_ref: &mut Self.A) {
+        let ref: &mut LibraCoin.T;
+        let zero: LibraCoin.T;
+
+        ref = &mut move(a_ref).c;
+        zero = LibraCoin.zero();
+        *move(ref) = move(zero);
+
+        return;
+    }
+}
+// check: WRITEREF_RESOURCE_ERROR

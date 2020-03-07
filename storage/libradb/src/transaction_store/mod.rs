@@ -3,12 +3,18 @@
 
 //! This file defines transaction store APIs that are related to committed signed transactions.
 
-use super::schema::signed_transaction::*;
-use crate::errors::LibraDbError;
-use failure::prelude::*;
-use schemadb::{SchemaBatch, DB};
+use crate::{
+    change_set::ChangeSet,
+    errors::LibraDbError,
+    schema::{transaction::TransactionSchema, transaction_by_account::TransactionByAccountSchema},
+};
+use anyhow::{ensure, format_err, Result};
+use libra_types::{
+    account_address::AccountAddress,
+    transaction::{Transaction, Version},
+};
+use schemadb::{SchemaIterator, DB};
 use std::sync::Arc;
-use types::transaction::{SignedTransaction, Version};
 
 pub(crate) struct TransactionStore {
     db: Arc<DB>,
@@ -19,21 +25,101 @@ impl TransactionStore {
         Self { db }
     }
 
+    /// Gets the version of a transaction by the sender `address` and `sequence_number`.
+    pub fn lookup_transaction_by_account(
+        &self,
+        address: AccountAddress,
+        sequence_number: u64,
+        ledger_version: Version,
+    ) -> Result<Option<Version>> {
+        if let Some(version) = self
+            .db
+            .get::<TransactionByAccountSchema>(&(address, sequence_number))?
+        {
+            if version <= ledger_version {
+                return Ok(Some(version));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Get signed transaction given `version`
-    pub fn get_transaction(&self, version: Version) -> Result<SignedTransaction> {
+    pub fn get_transaction(&self, version: Version) -> Result<Transaction> {
         self.db
-            .get::<SignedTransactionSchema>(&version)?
+            .get::<TransactionSchema>(&version)?
             .ok_or_else(|| LibraDbError::NotFound(format!("Txn {}", version)).into())
+    }
+
+    /// Gets an iterator that yields `num_transactions` transactions starting from `start_version`.
+    pub fn get_transaction_iter(
+        &self,
+        start_version: Version,
+        num_transactions: u64,
+    ) -> Result<TransactionIter> {
+        let mut iter = self.db.iter::<TransactionSchema>(Default::default())?;
+        iter.seek(&start_version)?;
+        Ok(TransactionIter {
+            inner: iter,
+            expected_next_version: start_version,
+            end_version: start_version
+                .checked_add(num_transactions)
+                .ok_or_else(|| format_err!("Too many transactions requested."))?,
+        })
     }
 
     /// Save signed transaction at `version`
     pub fn put_transaction(
         &self,
         version: Version,
-        signed_transaction: &SignedTransaction,
-        batch: &mut SchemaBatch,
+        transaction: &Transaction,
+        cs: &mut ChangeSet,
     ) -> Result<()> {
-        batch.put::<SignedTransactionSchema>(&version, signed_transaction)
+        if let Transaction::UserTransaction(txn) = transaction {
+            cs.batch.put::<TransactionByAccountSchema>(
+                &(txn.sender(), txn.sequence_number()),
+                &version,
+            )?;
+        }
+        cs.batch.put::<TransactionSchema>(&version, &transaction)?;
+
+        Ok(())
+    }
+}
+
+pub struct TransactionIter<'a> {
+    inner: SchemaIterator<'a, TransactionSchema>,
+    expected_next_version: Version,
+    end_version: Version,
+}
+
+impl<'a> TransactionIter<'a> {
+    fn next_impl(&mut self) -> Result<Option<Transaction>> {
+        if self.expected_next_version >= self.end_version {
+            return Ok(None);
+        }
+
+        let ret = match self.inner.next().transpose()? {
+            Some((version, transaction)) => {
+                ensure!(
+                    version == self.expected_next_version,
+                    "Transaction versions are not consecutive.",
+                );
+                self.expected_next_version += 1;
+                Some(transaction)
+            }
+            None => None,
+        };
+
+        Ok(ret)
+    }
+}
+
+impl<'a> Iterator for TransactionIter<'a> {
+    type Item = Result<Transaction>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_impl().transpose()
     }
 }
 

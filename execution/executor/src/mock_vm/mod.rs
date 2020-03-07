@@ -4,25 +4,29 @@
 #[cfg(test)]
 mod mock_vm_test;
 
-use config::config::VMConfig;
-use crypto::signing::generate_keypair;
-use state_view::StateView;
-use std::collections::HashMap;
-use types::{
+use libra_config::config::VMConfig;
+use libra_crypto::ed25519::compat;
+use libra_state_view::StateView;
+use libra_types::{
     access_path::AccessPath,
     account_address::{AccountAddress, ADDRESS_LENGTH},
     contract_event::ContractEvent,
+    crypto_proxies::ValidatorSet,
+    event::EventKey,
+    language_storage::TypeTag,
     transaction::{
-        Program, RawTransaction, SignedTransaction, TransactionArgument, TransactionOutput,
-        TransactionPayload, TransactionStatus,
+        RawTransaction, Script, SignedTransaction, Transaction, TransactionArgument,
+        TransactionOutput, TransactionPayload, TransactionStatus,
     },
-    vm_error::{ExecutionStatus, VMStatus},
+    vm_error::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use vm_runtime::VMExecutor;
+use libra_vm::VMExecutor;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 #[derive(Debug)]
-enum Transaction {
+enum MockVMTransaction {
     Mint {
         sender: AccountAddress,
         amount: u64,
@@ -34,29 +38,41 @@ enum Transaction {
     },
 }
 
-pub const KEEP_STATUS: TransactionStatus =
-    TransactionStatus::Keep(VMStatus::Execution(ExecutionStatus::Executed));
+pub static KEEP_STATUS: Lazy<TransactionStatus> =
+    Lazy::new(|| TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)));
 
 // We use 10 as the assertion error code for insufficient balance within the Libra coin contract.
-pub const DISCARD_STATUS: TransactionStatus =
-    TransactionStatus::Discard(VMStatus::Execution(ExecutionStatus::AssertionFailure(10)));
+pub static DISCARD_STATUS: Lazy<TransactionStatus> = Lazy::new(|| {
+    TransactionStatus::Discard(VMStatus::new(StatusCode::ABORTED).with_sub_status(10))
+});
 
 pub struct MockVM;
 
 impl VMExecutor for MockVM {
     fn execute_block(
-        transactions: Vec<SignedTransaction>,
+        transactions: Vec<Transaction>,
         _config: &VMConfig,
         state_view: &dyn StateView,
-    ) -> Vec<TransactionOutput> {
+    ) -> Result<Vec<TransactionOutput>, VMStatus> {
         if state_view.is_genesis() {
             assert_eq!(
                 transactions.len(),
                 1,
                 "Genesis block should have only one transaction."
             );
-            let output = TransactionOutput::new(gen_genesis_writeset(), vec![], 0, KEEP_STATUS);
-            return vec![output];
+            let output = TransactionOutput::new(
+                gen_genesis_writeset(),
+                // mock the validator set event
+                vec![ContractEvent::new(
+                    ValidatorSet::change_event_key(),
+                    0,
+                    TypeTag::Bool,
+                    lcs::to_bytes(&ValidatorSet::new(vec![])).unwrap(),
+                )],
+                0,
+                KEEP_STATUS.clone(),
+            );
+            return Ok(vec![output]);
         }
 
         // output_cache is used to store the output of transactions so they are visible to later
@@ -65,8 +81,8 @@ impl VMExecutor for MockVM {
         let mut outputs = vec![];
 
         for txn in transactions {
-            match decode_transaction(&txn) {
-                Transaction::Mint { sender, amount } => {
+            match decode_transaction(&txn.as_signed_user_txn().unwrap()) {
+                MockVMTransaction::Mint { sender, amount } => {
                     let old_balance = read_balance(&output_cache, state_view, sender);
                     let new_balance = old_balance + amount;
                     let old_seqnum = read_seqnum(&output_cache, state_view, sender);
@@ -77,9 +93,14 @@ impl VMExecutor for MockVM {
 
                     let write_set = gen_mint_writeset(sender, new_balance, new_seqnum);
                     let events = gen_events(sender);
-                    outputs.push(TransactionOutput::new(write_set, events, 0, KEEP_STATUS));
+                    outputs.push(TransactionOutput::new(
+                        write_set,
+                        events,
+                        0,
+                        KEEP_STATUS.clone(),
+                    ));
                 }
-                Transaction::Payment {
+                MockVMTransaction::Payment {
                     sender,
                     recipient,
                     amount,
@@ -91,7 +112,7 @@ impl VMExecutor for MockVM {
                             WriteSet::default(),
                             vec![],
                             0,
-                            DISCARD_STATUS,
+                            DISCARD_STATUS.clone(),
                         ));
                         continue;
                     }
@@ -117,13 +138,13 @@ impl VMExecutor for MockVM {
                         write_set,
                         events,
                         0,
-                        TransactionStatus::Keep(VMStatus::Execution(ExecutionStatus::Executed)),
+                        TransactionStatus::Keep(VMStatus::new(StatusCode::EXECUTED)),
                     ));
                 }
             }
         }
 
-        outputs
+        Ok(outputs)
     }
 }
 
@@ -160,13 +181,10 @@ fn read_seqnum_from_storage(state_view: &dyn StateView, seqnum_access_path: &Acc
 }
 
 fn read_u64_from_storage(state_view: &dyn StateView, access_path: &AccessPath) -> u64 {
-    match state_view
+    state_view
         .get(&access_path)
         .expect("Failed to query storage.")
-    {
-        Some(bytes) => decode_bytes(&bytes),
-        None => 0,
-    }
+        .map_or(0, |bytes| decode_bytes(&bytes))
 }
 
 fn decode_bytes(bytes: &[u8]) -> u64 {
@@ -235,23 +253,26 @@ fn gen_payment_writeset(
 }
 
 fn gen_events(sender: AccountAddress) -> Vec<ContractEvent> {
-    let access_path = AccessPath::new(sender, b"event".to_vec());
-    let event = ContractEvent::new(access_path, 0, b"event_data".to_vec());
-    vec![event]
+    vec![ContractEvent::new(
+        EventKey::new_from_address(&sender, 0),
+        0,
+        TypeTag::ByteArray,
+        b"event_data".to_vec(),
+    )]
 }
 
-pub fn encode_mint_program(amount: u64) -> Program {
+pub fn encode_mint_program(amount: u64) -> Script {
     let argument = TransactionArgument::U64(amount);
-    Program::new(vec![], vec![], vec![argument])
+    Script::new(vec![], vec![argument])
 }
 
-pub fn encode_transfer_program(recipient: AccountAddress, amount: u64) -> Program {
+pub fn encode_transfer_program(recipient: AccountAddress, amount: u64) -> Script {
     let argument1 = TransactionArgument::Address(recipient);
     let argument2 = TransactionArgument::U64(amount);
-    Program::new(vec![], vec![], vec![argument1, argument2])
+    Script::new(vec![], vec![argument1, argument2])
 }
 
-pub fn encode_mint_transaction(sender: AccountAddress, amount: u64) -> SignedTransaction {
+pub fn encode_mint_transaction(sender: AccountAddress, amount: u64) -> Transaction {
     encode_transaction(sender, encode_mint_program(amount))
 }
 
@@ -259,36 +280,38 @@ pub fn encode_transfer_transaction(
     sender: AccountAddress,
     recipient: AccountAddress,
     amount: u64,
-) -> SignedTransaction {
+) -> Transaction {
     encode_transaction(sender, encode_transfer_program(recipient, amount))
 }
 
-fn encode_transaction(sender: AccountAddress, program: Program) -> SignedTransaction {
+fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
     let raw_transaction =
-        RawTransaction::new(sender, 0, program, 0, 0, std::time::Duration::from_secs(0));
+        RawTransaction::new_script(sender, 0, program, 0, 0, std::time::Duration::from_secs(0));
 
-    let (privkey, pubkey) = generate_keypair();
-    raw_transaction
-        .sign(&privkey, pubkey)
-        .expect("Failed to sign raw transaction.")
+    let (privkey, pubkey) = compat::generate_keypair(None);
+    Transaction::UserTransaction(
+        raw_transaction
+            .sign(&privkey, pubkey)
+            .expect("Failed to sign raw transaction.")
+            .into_inner(),
+    )
 }
 
-fn decode_transaction(txn: &SignedTransaction) -> Transaction {
+fn decode_transaction(txn: &SignedTransaction) -> MockVMTransaction {
     let sender = txn.sender();
     match txn.payload() {
-        TransactionPayload::Program(program) => {
-            assert!(program.code().is_empty(), "Code should be empty.");
-            assert!(program.modules().is_empty(), "Modules should be empty.");
-            match program.args().len() {
-                1 => match program.args()[0] {
-                    TransactionArgument::U64(amount) => Transaction::Mint { sender, amount },
+        TransactionPayload::Script(script) => {
+            assert!(script.code().is_empty(), "Code should be empty.");
+            match script.args().len() {
+                1 => match script.args()[0] {
+                    TransactionArgument::U64(amount) => MockVMTransaction::Mint { sender, amount },
                     _ => unimplemented!(
                         "Only one integer argument is allowed for mint transactions."
                     ),
                 },
-                2 => match (&program.args()[0], &program.args()[1]) {
+                2 => match (&script.args()[0], &script.args()[1]) {
                     (TransactionArgument::Address(recipient), TransactionArgument::U64(amount)) => {
-                        Transaction::Payment {
+                        MockVMTransaction::Payment {
                             sender,
                             recipient: *recipient,
                             amount: *amount,
@@ -304,6 +327,12 @@ fn decode_transaction(txn: &SignedTransaction) -> Transaction {
         }
         TransactionPayload::WriteSet(_) => {
             unimplemented!("MockVM does not support WriteSet transaction payload.")
+        }
+        TransactionPayload::Program => {
+            unimplemented!("MockVM does not support Program transaction payload.")
+        }
+        TransactionPayload::Module(_) => {
+            unimplemented!("MockVM does not support Module transaction payload.")
         }
     }
 }
